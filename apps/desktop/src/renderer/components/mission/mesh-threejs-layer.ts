@@ -20,7 +20,11 @@ export interface MeshThreeJsLayer {
 /** Same frame as mission-threejs-layer: Translation * Scale(s, -s, s) * RotateX(pi/2). */
 export function createMeshThreeJsLayer(): MeshThreeJsLayer {
   const scene = new THREE.Scene();
-  scene.add(new THREE.AmbientLight(0xffffff, 1.0));
+  scene.add(new THREE.AmbientLight(0xffffff, 0.55));
+  scene.add(new THREE.HemisphereLight(0xcfe3ff, 0x4a5d3f, 0.9));
+  const sun = new THREE.DirectionalLight(0xfff6e6, 1.3);
+  sun.position.set(120, 220, 90);
+  scene.add(sun);
   const camera = new THREE.Camera();
   let renderer: THREE.WebGLRenderer | null = null;
   let map: maplibregl.Map | null = null;

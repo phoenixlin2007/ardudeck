@@ -25,7 +25,14 @@ import { type ModelKey, FALLBACK_MODEL, CLASS_MODEL, modelKeyForClass } from './
 import type { SimDiagnostics, SimLoad } from '../../stores/sim-state-store';
 import { createWaypointSymbology } from '../camera/hud3d/waypoint-symbology';
 import { attachDrape } from '../camera/svt/drape-material';
+import {
+  createGoogle3dTilesController,
+  type Google3dTilesStatus,
+} from '../camera/svt/google-3d-tiles';
 import type { DrapeRing } from '../camera/svt/svt-satellite';
+import { type ElevationGrid, sampleElevation } from '../camera/svt/svt-terrain';
+import type { SceneMeshEntry } from '../../../shared/tile-source-types';
+import { loadGltfScene, releaseGltf } from '../../three/gltf-cache';
 import { buildTemplateFromBlueprint } from './sim-frame-builder';
 import type { FrameBlueprintProfile } from '../../../shared/ipc-channels';
 
@@ -154,9 +161,21 @@ export interface SimWorldScene {
    * sits at y = 0, matching the NED vehicle frame.
    */
   setTerrain: (geometry: THREE.BufferGeometry | null, yOffset?: number) => void;
+  /** Place custom/module GLB meshes relative to the sim's geographic origin. */
+  setMeshes: (entries: SceneMeshEntry[], origin: { lat: number; lon: number } | null, grid?: ElevationGrid | null) => void;
   /** Drape satellite imagery over the terrain; null returns to the elevation
       ramp. Same rings the synthetic-vision view builds. */
   setDrape: (rings: DrapeRing[] | null) => void;
+  /** Enable/disable and configure Google Map Tiles API Photorealistic 3D Tiles. */
+  setGoogle3dTiles: (opts: {
+    enabled: boolean;
+    apiKey: string;
+    origin?: { lat: number; lon: number } | null;
+    homeElevMsl?: number;
+    maxScreenSpaceError?: number;
+    onStatusChange?: (status: Google3dTilesStatus, message?: string) => void;
+    onAttributionChange?: (attribution: string) => void;
+  }) => void;
   /** Show/hide the reference grid (spatial-perception aid, over flat ground and
       SVT terrain alike). Default on. */
   setGrid: (on: boolean) => void;
@@ -417,6 +436,38 @@ export function createSimWorldScene(canvas: HTMLCanvasElement): SimWorldScene {
   const terrainMat = new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 1, metalness: 0 });
   const drape = attachDrape(terrainMat);
   let terrainMesh: THREE.Mesh | null = null;
+  let terrainBaseYOffset = 0;
+  let simViewportHeight = 720;
+
+  let g3dStatusCb: ((status: Google3dTilesStatus, message?: string) => void) | undefined;
+  let g3dAttrCb: ((attribution: string) => void) | undefined;
+  const syncSimGroundWith3dTiles = () => {
+    const has3d = google3d.hasLoadedTiles();
+    if (terrainMesh) {
+      terrainMesh.position.y = terrainBaseYOffset + (has3d ? -28 : 0);
+      ground.visible = false;
+      (scene.fog as THREE.Fog).far = 7000;
+    } else if (has3d) {
+      ground.visible = false;
+      (scene.fog as THREE.Fog).far = 7000;
+    } else {
+      ground.visible = true;
+      (scene.fog as THREE.Fog).far = DEFAULT_FOG_FAR;
+    }
+  };
+  const google3d = createGoogle3dTilesController({
+    onStatusChange: (st, msg) => {
+      syncSimGroundWith3dTiles();
+      g3dStatusCb?.(st, msg);
+    },
+    onAttributionChange: (attr) => {
+      g3dAttrCb?.(attr);
+    },
+    onDirty: () => {
+      syncSimGroundWith3dTiles();
+    },
+  });
+  scene.add(google3d.group);
 
   function setTerrain(geometry: THREE.BufferGeometry | null, yOffset = 0): void {
     if (terrainMesh) {
@@ -424,20 +475,72 @@ export function createSimWorldScene(canvas: HTMLCanvasElement): SimWorldScene {
       terrainMesh.geometry.dispose();
       terrainMesh = null;
     }
+    terrainBaseYOffset = yOffset;
     if (geometry) {
       terrainMesh = new THREE.Mesh(geometry, terrainMat);
       terrainMesh.frustumCulled = false;
-      terrainMesh.position.y = yOffset;
+      terrainMesh.position.y = yOffset + (google3d.hasLoadedTiles() ? -28 : 0);
       scene.add(terrainMesh);
-      ground.visible = false;
-      // The reference grid stays (it drapes the home plane over the terrain);
-      // its visibility is owned by setGrid, not the terrain toggle.
-      (scene.fog as THREE.Fog).far = 7000; // see across real terrain, not 2.6 km
-    } else {
-      ground.visible = true;
-      (scene.fog as THREE.Fog).far = DEFAULT_FOG_FAR;
     }
+    syncSimGroundWith3dTiles();
     grid.visible = gridEnabled;
+  }
+
+  const customMeshGroups = new Map<string, THREE.Group>();
+  const customMeshUrls = new Map<string, { url: string; version: number }>();
+
+  function setMeshes(entries: SceneMeshEntry[], origin: { lat: number; lon: number } | null, elevGrid?: ElevationGrid | null): void {
+    const wanted = new Set(entries.map((e) => `${e.key}@${e.version ?? 0}`));
+    for (const [k, g] of customMeshGroups) {
+      if (!wanted.has(k)) {
+        scene.remove(g);
+        customMeshGroups.delete(k);
+        const gone = customMeshUrls.get(k);
+        customMeshUrls.delete(k);
+        if (gone) void releaseGltf(gone.url, gone.version);
+      }
+    }
+    for (const e of entries) customMeshUrls.set(`${e.key}@${e.version ?? 0}`, { url: e.url, version: e.version ?? 0 });
+    if (!origin) return;
+
+    const homeElev = elevGrid ? sampleElevation(elevGrid, origin.lat, origin.lon) : 0;
+    const mPerDegLon = 111_320 * Math.cos((origin.lat * Math.PI) / 180);
+
+    for (const e of entries) {
+      const k = `${e.key}@${e.version ?? 0}`;
+      const place = (g: THREE.Group) => {
+        const east = (e.origin.lng - origin.lon) * mPerDegLon;
+        const north = (e.origin.lat - origin.lat) * 111_320;
+        if (Math.hypot(east, north) > 8_000) {
+          g.visible = false;
+          return;
+        }
+        g.visible = true;
+        let y = 0;
+        if (elevGrid) {
+          const groundMsl = sampleElevation(elevGrid, e.origin.lat, e.origin.lng);
+          const msl = Number.isFinite(groundMsl) ? Math.max(e.origin.altMsl, groundMsl) : e.origin.altMsl;
+          y = msl - homeElev;
+        }
+        g.position.set(east, y, -north);
+        g.rotation.y = -((e.yawDeg ?? 0) * Math.PI) / 180;
+      };
+      const existing = customMeshGroups.get(k);
+      if (existing) {
+        place(existing);
+        continue;
+      }
+      void loadGltfScene(e.url, e.version ?? 0)
+        .then((g) => {
+          if (!wanted.has(k) || customMeshGroups.has(k)) return;
+          place(g);
+          customMeshGroups.set(k, g);
+          scene.add(g);
+        })
+        .catch((err: unknown) => {
+          console.warn(`[SimWorldScene] could not load mesh ${e.url}:`, err);
+        });
+    }
   }
 
   // Concentric range rings + home pad at the origin. Rings are labelled with
@@ -1254,6 +1357,7 @@ export function createSimWorldScene(canvas: HTMLCanvasElement): SimWorldScene {
 
   return {
     resize(width: number, height: number) {
+      simViewportHeight = Math.max(1, height);
       renderer.setSize(width, height, false);
       camera.aspect = width / Math.max(1, height);
       camera.updateProjectionMatrix();
@@ -1261,6 +1365,21 @@ export function createSimWorldScene(canvas: HTMLCanvasElement): SimWorldScene {
 
     setDrape(rings: DrapeRing[] | null) {
       drape.setDrape(rings, renderer);
+    },
+
+    setGoogle3dTiles(opts) {
+      g3dStatusCb = opts.onStatusChange;
+      g3dAttrCb = opts.onAttributionChange;
+      if (opts.origin && (opts.origin.lat !== 0 || opts.origin.lon !== 0)) {
+        const homeElev = opts.homeElevMsl ?? -terrainBaseYOffset;
+        google3d.setOrigin(opts.origin.lat, opts.origin.lon, -homeElev);
+      }
+      google3d.configure({
+        enabled: opts.enabled,
+        apiKey: opts.apiKey,
+        maxScreenSpaceError: opts.maxScreenSpaceError,
+      });
+      syncSimGroundWith3dTiles();
     },
 
     update(data: SimWorldUpdate) {
@@ -1439,6 +1558,8 @@ export function createSimWorldScene(canvas: HTMLCanvasElement): SimWorldScene {
         }
       }
       updateCamera();
+      google3d.updateForCamera(camera, simViewportHeight);
+      syncSimGroundWith3dTiles();
       // Labels: scale with camera distance (approx constant screen size, so they
       // neither stack into an unreadable pile up close nor shrink to dots far
       // out), plus a small per-vehicle stagger separating co-located labels.
@@ -1457,6 +1578,8 @@ export function createSimWorldScene(canvas: HTMLCanvasElement): SimWorldScene {
     },
 
     setTerrain,
+
+    setMeshes,
 
     setGrid,
 
@@ -1513,6 +1636,7 @@ export function createSimWorldScene(canvas: HTMLCanvasElement): SimWorldScene {
     },
 
     dispose() {
+      google3d.dispose();
       if (terrainMesh) terrainMesh.geometry.dispose();
       drape.dispose();
       terrainMat.dispose();

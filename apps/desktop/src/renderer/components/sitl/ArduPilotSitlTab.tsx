@@ -39,7 +39,9 @@ const VEHICLE_TYPE_OPTIONS: Array<{ value: ArduPilotVehicleType; labelKey: strin
 
 // One-click home presets for the in-app simulator. CMAC is ArduPilot's canonical
 // SITL home (Canberra Model Aircraft Club); the rest are well-known open spaces.
-const HOME_PRESETS: Array<{ name: string; nameKey: string; lat: number; lng: number; alt: number; heading: number }> = [
+const HOME_PRESETS: Array<{ name: string; nameKey?: string; lat: number; lng: number; alt: number; heading: number }> = [
+  { name: '台北 101 (Taipei 101)', lat: 25.0308, lng: 121.564468, alt: 12, heading: 0 }, // i18n-exempt
+  { name: '中正紀念堂 (CKS Hall)', lat: 25.0363, lng: 121.5192, alt: 9, heading: 122 }, // i18n-exempt
   { name: 'CMAC (default)', nameKey: 'sitl:tab.presetCmac', lat: -35.3632621, lng: 149.1652374, alt: 584, heading: 353 },
   { name: 'SF Bay', nameKey: 'sitl:tab.presetSfBay', lat: 37.7749, lng: -122.4194, alt: 0, heading: 270 },
   { name: 'Nevada Desert', nameKey: 'sitl:tab.presetNevada', lat: 39.5296, lng: -119.8138, alt: 1370, heading: 0 }, // i18n-exempt
@@ -794,7 +796,7 @@ export default function ArduPilotSitlTab() {
                         : 'bg-surface border text-content-secondary hover:bg-surface hover:text-content'
                     } disabled:opacity-50 disabled:cursor-not-allowed`}
                   >
-                    {t(p.nameKey)}
+                    {p.nameKey ? t(p.nameKey) : p.name}
                   </button>
                 );
               })}

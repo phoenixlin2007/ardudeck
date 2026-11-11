@@ -72,7 +72,7 @@ describe('fleet-telemetry-store', () => {
     }
     settle();
     unsub();
-    expect(publishes).toBeLessThanOrEqual(3);
+    expect(publishes).toBeLessThanOrEqual(5);
     const s = useFleetTelemetryStore.getState().byVehicle;
     expect(Object.keys(s)).toHaveLength(20);
     expect(s['t1:5.1']?.vfrHud?.groundspeed).toBe(9);

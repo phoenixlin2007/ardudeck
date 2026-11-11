@@ -757,6 +757,11 @@ function App() {
       const identity = vehicleIdentityOf(state);
       if (isNewVehicleIdentity(lastVehicleIdentityRef.current, identity)) {
         resetVehicleStores();
+        const activeKey = useActiveVehicleStore.getState().activeVehicleKey ?? state.focus?.vehicleKey ?? null;
+        if (activeKey) {
+          const snapshot = useFleetTelemetryStore.getState().byVehicle[activeKey];
+          if (snapshot) useTelemetryStore.getState().updateBatch(snapshot);
+        }
       }
       if (identity !== null) lastVehicleIdentityRef.current = identity;
     });

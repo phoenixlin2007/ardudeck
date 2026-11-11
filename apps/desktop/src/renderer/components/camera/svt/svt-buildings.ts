@@ -231,7 +231,13 @@ export function loadBuildings(source: SvtBuildings, lat: number, lon: number): P
 // ─── Geometry ────────────────────────────────────────────────────────────────
 
 /** One mesh for all buildings, each standing on the lowest terrain under its footprint so no corner floats. */
-export function buildBuildingsGeometry(buildings: Building[], grid: ElevationGrid, center: { lat: number; lon: number }, radiusM = BUILDINGS_RADIUS_M): THREE.BufferGeometry | null {
+export function buildBuildingsGeometry(
+  buildings: Building[],
+  grid: ElevationGrid,
+  center: { lat: number; lon: number },
+  radiusM = BUILDINGS_RADIUS_M,
+  excludeOrigins?: Array<{ lat: number; lng: number }>,
+): THREE.BufferGeometry | null {
   const pos: number[] = [];
   const nrm: number[] = [];
   const col: number[] = [];
@@ -266,6 +272,7 @@ export function buildBuildingsGeometry(buildings: Building[], grid: ElevationGri
     }
   };
   const center2 = lonLatToLocal(grid, center.lat, center.lon);
+  const exclusions = (excludeOrigins ?? []).map((o) => lonLatToLocal(grid, o.lat, o.lng));
   let count = 0;
   for (const b of buildings) {
     if (count >= MAX_BUILDINGS) break;
@@ -283,6 +290,7 @@ export function buildBuildingsGeometry(buildings: Building[], grid: ElevationGri
     const c = outer[0]!;
     if (Math.hypot(c.x - center2.x, c.z - center2.z) > radiusM) continue;
     if (Math.abs(c.x) > grid.halfSizeM || Math.abs(c.z) > grid.halfSizeM) continue;
+    if (exclusions.some((ex) => outer.some((pt) => Math.hypot(pt.x - ex.x, pt.z - ex.z) < 65))) continue;
 
     let ground = Infinity;
     for (const [lon, lat] of b.rings[0]!) ground = Math.min(ground, sampleElevation(grid, lat, lon));

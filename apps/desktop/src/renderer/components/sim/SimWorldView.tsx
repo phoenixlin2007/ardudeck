@@ -8,7 +8,7 @@
  */
 
 import { useEffect, useRef, useState, useCallback } from 'react';
-import { SvtImageryPicker } from '../camera/svt/SvtImageryPicker';
+import { SvtImageryPicker, Google3dTilesSettingsSection } from '../camera/svt/SvtImageryPicker';
 import { useTranslation } from 'react-i18next';
 import { useSimStateStore, type SimStateMessage } from '../../stores/sim-state-store';
 import { useTelemetryStore } from '../../stores/telemetry-store';
@@ -55,6 +55,7 @@ import {
   recenterDistanceM,
 } from '../camera/svt/svt-satellite';
 import { useCameraStore } from '../../stores/camera-store';
+import { meshesFor, useSceneMeshStore } from '../../stores/scene-mesh-store';
 
 /** The sim world is a local patch about the launch point, not the wide SVT
  * one, so the quality level maps to its own densities. */
@@ -727,6 +728,37 @@ export default function SimWorldView() {
     };
   }, [showTerrain, fixSignal, quality, originRev]);
 
+  const meshVersion = useSceneMeshStore((s) => s.version);
+  const customGlbEnabled = useSceneMeshStore((s) => s.enabled);
+  const toggleCustomGlb = useSceneMeshStore((s) => s.toggleEnabled);
+  const google3dTiles = useCameraStore((s) => s.google3dTiles);
+  const toggleGoogle3dTiles = useCameraStore((s) => s.toggleGoogle3dTiles);
+  const setGoogle3dTiles = useCameraStore((s) => s.setGoogle3dTiles);
+  const googleMapsApiKey = useCameraStore((s) => s.googleMapsApiKey);
+  const setGoogleMapsApiKey = useCameraStore((s) => s.setGoogleMapsApiKey);
+  const [g3dStatus, setG3dStatus] = useState<'idle' | 'loading' | 'ready' | 'error'>('idle');
+  const [g3dErrorMsg, setG3dErrorMsg] = useState<string | undefined>(undefined);
+  const [draftApiKey, setDraftApiKey] = useState('');
+  useEffect(() => {
+    sceneRef.current?.setMeshes(meshesFor('svt'), geoOriginRef.current, simGrid);
+  }, [meshVersion, fixSignal, originRev, simGrid]);
+  useEffect(() => {
+    const origin = geoOriginRef.current ?? flatLatLon();
+    const homeElev = origin && simGrid ? sampleElevation(simGrid, origin.lat, origin.lon) : 0;
+    const maxSSE = quality === 'high' ? 10 : quality === 'low' ? 26 : 16;
+    sceneRef.current?.setGoogle3dTiles({
+      enabled: google3dTiles,
+      apiKey: googleMapsApiKey,
+      origin,
+      homeElevMsl: homeElev,
+      maxScreenSpaceError: maxSSE,
+      onStatusChange: (st, msg) => {
+        setG3dStatus(st);
+        setG3dErrorMsg(msg);
+      },
+    });
+  }, [google3dTiles, googleMapsApiKey, quality, fixSignal, originRev, simGrid]);
+
   // Satellite drape over the sim terrain: same rings the synthetic-vision view
   // builds, centred on the sim's own origin (the world is local metres about
   // it, so the rings' local-ENU rects line up unchanged).
@@ -928,6 +960,7 @@ export default function SimWorldView() {
             <>
               <div className="fixed inset-0 z-30" onClick={() => setShowTerrainMenu(false)} />
               <div className="absolute right-0 top-9 z-40 w-52 rounded-lg border border-default bg-surface-solid p-1.5 shadow-xl">
+                <Google3dTilesSettingsSection />
                 <label className="flex cursor-pointer items-center gap-2 rounded px-1.5 py-1 text-[11px] text-content hover:bg-surface-raised">
                   <input
                     type="checkbox"
@@ -957,6 +990,26 @@ export default function SimWorldView() {
             </>
           )}
         </div>
+        <button
+          onClick={toggleGoogle3dTiles}
+          data-tip="啟用 / 停用 Google Map Tiles API Photorealistic 3D Tiles" // i18n-exempt
+          className={`rounded-lg border border-subtle px-3 py-1.5 text-xs font-medium shadow-lg transition-colors ${
+            google3dTiles ? 'bg-sky-600 text-white' : 'bg-surface-raised text-content-secondary hover:text-content'
+          }`}
+        >
+          {/* i18n-exempt */}
+          Google 3D
+        </button>
+        <button
+          onClick={toggleCustomGlb}
+          data-tip="顯示 / 隱藏自訂 3D GLB 模型 (Toggle Custom 3D GLB Landmarks)" // i18n-exempt
+          className={`rounded-lg border border-subtle px-3 py-1.5 text-xs font-medium shadow-lg transition-colors ${
+            customGlbEnabled ? 'bg-emerald-600 text-white' : 'bg-surface-raised text-content-secondary hover:text-content'
+          }`}
+        >
+          {/* i18n-exempt */}
+          3D GLB
+        </button>
         <button
           onClick={() => setShowXray((v) => !v)}
           data-tip={t('sim:worldView.xrayTip')}
@@ -1023,6 +1076,65 @@ export default function SimWorldView() {
       {terrainError && (
         <div className="absolute top-14 right-3 z-10 rounded-md border border-rose-500/30 bg-rose-500/10 px-2.5 py-1 text-[11px] text-rose-300 pointer-events-none">
           {t(terrainError)}
+        </div>
+      )}
+
+      {google3dTiles && (!googleMapsApiKey || g3dStatus === 'error') && (
+        <div className="absolute top-14 right-3 z-20 flex flex-col gap-1.5 rounded-lg border border-sky-500/40 bg-slate-900/90 p-2.5 text-xs text-white shadow-xl backdrop-blur-md">
+          <div className="flex items-center justify-between gap-4">
+            {/* i18n-exempt */}
+            <span className="font-semibold text-sky-300">Google Map Tiles API — Photorealistic 3D Tiles</span>
+            <button
+              type="button"
+              onClick={() => setGoogle3dTiles(false)}
+              className="text-[11px] text-white/60 hover:text-white"
+            >
+              ✕
+            </button>
+          </div>
+          {g3dStatus === 'error' && g3dErrorMsg && (
+            <div className="flex items-center justify-between gap-2 text-[11px] text-amber-300">
+              {/* i18n-exempt */}
+              <span>載入失敗：{g3dErrorMsg}</span>
+              {googleMapsApiKey && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    setGoogleMapsApiKey('');
+                    setDraftApiKey('');
+                  }}
+                  className="shrink-0 rounded border border-rose-400/40 bg-rose-500/20 px-1.5 py-0.5 text-[10px] text-rose-200 hover:bg-rose-500/30"
+                >
+                  {/* i18n-exempt */}
+                  清除舊 Key
+                </button>
+              )}
+            </div>
+          )}
+          <div className="flex items-center gap-1.5">
+            <input
+              type="password"
+              value={draftApiKey}
+              onChange={(e) => setDraftApiKey(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter' && draftApiKey.trim()) {
+                  setGoogleMapsApiKey(draftApiKey.trim());
+                }
+              }}
+              placeholder="貼上 Google Map Tiles API Key..." // i18n-exempt
+              className="w-60 rounded border border-white/20 bg-black/60 px-2 py-1 text-[11px] font-mono text-white focus:border-sky-400 focus:outline-none"
+            />
+            <button
+              type="button"
+              onClick={() => {
+                if (draftApiKey.trim()) setGoogleMapsApiKey(draftApiKey.trim());
+              }}
+              className="rounded bg-sky-600 px-2.5 py-1 text-[11px] font-medium text-white hover:bg-sky-500"
+            >
+              {/* i18n-exempt */}
+              套用並載入
+            </button>
+          </div>
         </div>
       )}
 

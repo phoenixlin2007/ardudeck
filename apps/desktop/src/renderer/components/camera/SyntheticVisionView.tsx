@@ -18,9 +18,11 @@ import { useSmoothTelemetry } from '../../perf/render-governor';
 import { useConnectionStore } from '../../stores/connection-store';
 import { getVehicleClass } from '../../../shared/telemetry-types';
 import { useFleetTelemetryStore } from '../../stores/fleet-telemetry-store';
+import { useActiveVehicleStore } from '../../stores/active-vehicle-store';
+import { useVehicleAppearanceStore, resolveVehicleColor } from '../../stores/vehicle-appearance-store';
 import { useCameraStore } from '../../stores/camera-store';
 import { CameraOverlays } from './CameraOverlays';
-import { createSvtScene, type SvtScene, type SvtPose } from './svt/svt-scene';
+import { createSvtScene, type SvtScene, type SvtPose, type SvtPeerVehicle } from './svt/svt-scene';
 import {
   approxDistanceM,
   buildTerrainGeometry,
@@ -223,10 +225,35 @@ export function SyntheticVisionView({ vehicle, isPrimary, osd, onActivate, strea
   const buildingsSource = useCameraStore((s) => validBuildings(s.svtBuildings));
   const roofImagery = useCameraStore((s) => s.svtRoofImagery);
   const facades = useCameraStore((s) => s.svtFacades);
+  const google3dTiles = useCameraStore((s) => s.google3dTiles);
+  const googleMapsApiKey = useCameraStore((s) => s.googleMapsApiKey);
+  const setGoogleMapsApiKey = useCameraStore((s) => s.setGoogleMapsApiKey);
+  const setGoogle3dTiles = useCameraStore((s) => s.setGoogle3dTiles);
+  const [g3dStatus, setG3dStatus] = useState<'idle' | 'loading' | 'ready' | 'error'>('idle');
+  const [g3dErrorMsg, setG3dErrorMsg] = useState<string | undefined>(undefined);
+  const [g3dAttribution, setG3dAttribution] = useState<string>('Google Photorealistic 3D Tiles');
+  const [draftApiKey, setDraftApiKey] = useState('');
   useEffect(() => {
     sceneRef.current?.setBuildingStyle({ roofImagery, facades });
     dirtyRef.current = true;
   }, [roofImagery, facades]);
+  useEffect(() => {
+    const maxSSE = quality === 'high' ? 10 : quality === 'low' ? 26 : 16;
+    sceneRef.current?.setGoogle3dTiles({
+      enabled: google3dTiles,
+      apiKey: googleMapsApiKey,
+      maxScreenSpaceError: maxSSE,
+      onStatusChange: (st, msg) => {
+        setG3dStatus(st);
+        setG3dErrorMsg(msg);
+        dirtyRef.current = true;
+      },
+      onAttributionChange: (attr) => {
+        if (attr) setG3dAttribution(`Google · ${attr}`);
+      },
+    });
+    dirtyRef.current = true;
+  }, [google3dTiles, googleMapsApiKey, quality]);
   const buildingsTokenRef = useRef(0);
   const [buildingsStatus, setBuildingsStatus] = useState<'idle' | 'loading' | 'ready' | 'error'>('idle');
   const buildingsShownRef = useRef<string | null>(null);
@@ -263,13 +290,17 @@ export function SyntheticVisionView({ vehicle, isPrimary, osd, onActivate, strea
   const flatGroundspeed = useTelemetryStore((s) => s.vfrHud.groundspeed);
   const flatAttitude = useTelemetryStore((s) => s.attitude);
   const flatAltMsl = useTelemetryStore((s) => s.position.alt);
+  const flatAltAgl = useTelemetryStore((s) => s.position.relativeAlt);
   const fleetAttitude = useFleetTelemetryStore((s) => (vehicle ? s.byVehicle[vehicle.key]?.attitude : undefined));
+
+  const vehicleKey = vehicle?.key ?? null;
+  const datumByVehicleRef = useRef<Map<string, number>>(new Map());
 
   const position = vehicle?.position ?? null;
   const att = isPrimary ? flatAttitude : fleetAttitude;
-  const armed = isPrimary ? flatArmed : (vehicle?.armed ?? false);
+  const armed = (isPrimary ? flatArmed : false) || (vehicle?.armed ?? false);
   const climbRate = isPrimary ? flatClimb : 0;
-  const groundspeed = isPrimary ? flatGroundspeed : (vehicle?.groundspeed ?? 0);
+  const groundspeed = isPrimary ? Math.max(flatGroundspeed, vehicle?.groundspeed ?? 0) : (vehicle?.groundspeed ?? 0);
 
   // Calibrate the altitude datum while the vehicle is on the ground: there its
   // true eye height IS the terrain height, so the difference from its reported
@@ -278,17 +309,27 @@ export function SyntheticVisionView({ vehicle, isPrimary, osd, onActivate, strea
   // rising ground rises into view as it does in the world.
   useEffect(() => {
     // Disarmed and stationary means it is standing on the ground, so its eye
-    // height IS the terrain height. NOT keyed on relative altitude: that is
-    // measured from HOME, which can sit metres above or below the ground the
-    // vehicle is actually on, and a wrong offset pins the camera to the terrain
-    // floor for the first several metres of a climb.
+    // height IS the terrain height. Also guard against transient store resets
+    // during fleet vehicle switches where `armed` or `vfrHud` may briefly read
+    // false/0 while `GLOBAL_POSITION_INT` already reports airborne altitude/velocity.
     if (armed || !drapeGrid || !position) return;
     if (Math.abs(climbRate) > 0.5 || groundspeed > 1) return;
+    const agl = isPrimary
+      ? Math.max(Math.abs(flatAltAgl), Math.abs(vehicle?.altitudeAgl ?? 0))
+      : Math.abs(vehicle?.altitudeAgl ?? 0);
+    if (agl > 3.0) return;
+    const posState = isPrimary
+      ? useTelemetryStore.getState().position
+      : (vehicleKey ? useFleetTelemetryStore.getState().byVehicle[vehicleKey]?.position : undefined);
+    if (posState && (Math.hypot(posState.vx, posState.vy) > 1.0 || Math.abs(posState.vz) > 0.5)) return;
+    if (approxDistanceM(drapeGrid.centerLat, drapeGrid.centerLon, position[0], position[1]) > SVT_REBUILD_DISTANCE_M) return;
     const altMsl = isPrimary ? flatAltMsl : vehicle?.altitudeMsl ?? 0;
     if (altMsl === 0) return;
-    datumOffsetRef.current = sampleElevation(drapeGrid, position[0], position[1]) - altMsl;
+    const nextOffset = sampleElevation(drapeGrid, position[0], position[1]) - altMsl;
+    datumOffsetRef.current = nextOffset;
+    if (vehicleKey) datumByVehicleRef.current.set(vehicleKey, nextOffset);
     dirtyRef.current = true;
-  }, [armed, drapeGrid, position, climbRate, groundspeed, vehicle?.altitudeMsl, flatAltMsl, isPrimary]);
+  }, [armed, drapeGrid, position, climbRate, groundspeed, vehicle?.altitudeMsl, vehicle?.altitudeAgl, flatAltMsl, flatAltAgl, isPrimary, vehicleKey]);
 
   // Latest pose for the render loop — assigned during render (cheap, idempotent).
   const nextPose = position
@@ -313,7 +354,23 @@ export function SyntheticVisionView({ vehicle, isPrimary, osd, onActivate, strea
   }
   poseRef.current = nextPose;
 
-  const vehicleKey = vehicle?.key ?? null;
+  const vehicleKeyRef = useRef<string | null>(vehicleKey);
+  vehicleKeyRef.current = vehicleKey;
+  const ownSysidRef = useRef<number | null>(vehicle?.sysid ?? null);
+  ownSysidRef.current = vehicle?.sysid ?? null;
+  const peerSmoothRef = useRef<
+    Map<
+      string,
+      {
+        lastUpdateWall: number;
+        posSample: Sample<PosSample>;
+        attSample: Sample<AttSample>;
+        shownPos: PosSample;
+        shownAtt: AttSample;
+      }
+    >
+  >(new Map());
+  const hadPeersRef = useRef(false);
 
   // ─── Telemetry sampling ───────────────────────────────────────────────────
   // Straight off the store, not out of the render body: React coalesces updates
@@ -321,6 +378,16 @@ export function SyntheticVisionView({ vehicle, isPrimary, osd, onActivate, strea
   // attitude lost samples and got uneven timestamps (it stepped while position
   // glided). A store subscription sees every update at its arrival instant.
   useEffect(() => {
+    // Switching vehicles in the fleet bar: restore this vehicle's ground datum
+    // offset and reset interpolation buffers so the camera snaps cleanly to the
+    // newly selected vehicle at its true altitude.
+    datumOffsetRef.current = (vehicleKey ? datumByVehicleRef.current.get(vehicleKey) : undefined) ?? 0;
+    posBufRef.current = [];
+    attBufRef.current = [];
+    shownPosRef.current = null;
+    shownAttRef.current = null;
+    dirtyRef.current = true;
+
     const pushPos = (t: number, v: PosSample) => {
       const buf = posBufRef.current;
       const last = buf[buf.length - 1]?.v;
@@ -343,6 +410,31 @@ export function SyntheticVisionView({ vehicle, isPrimary, osd, onActivate, strea
       pushSample(attBufRef.current, t, v);
       dirtyRef.current = true;
     };
+
+    // Seed buffers immediately from the selected vehicle's latest accumulated telemetry
+    const seedNow = performance.now();
+    const seedTel = vehicleKey ? useFleetTelemetryStore.getState().byVehicle[vehicleKey] : undefined;
+    if (seedTel?.gps && seedTel.gps.fixType >= 2 && (seedTel.gps.lat !== 0 || seedTel.gps.lon !== 0) && seedTel.position) {
+      pushPos(seedNow, {
+        lat: seedTel.gps.lat,
+        lon: seedTel.gps.lon,
+        altMsl: seedTel.position.alt,
+        agl: seedTel.position.relativeAlt,
+        vN: seedTel.position.vx,
+        vE: seedTel.position.vy,
+        vD: seedTel.position.vz,
+      });
+    }
+    if (seedTel?.attitude) {
+      pushAtt(seedNow, {
+        rollDeg: seedTel.attitude.roll,
+        pitchDeg: seedTel.attitude.pitch,
+        headingDeg: headingFrom(seedTel.attitude.yaw, seedTel.vfrHud?.heading ?? 0),
+        rollRate: seedTel.attitude.rollSpeed,
+        pitchRate: seedTel.attitude.pitchSpeed,
+        yawRate: seedTel.attitude.yawSpeed,
+      });
+    }
 
     if (isPrimary) {
       return useTelemetryStore.subscribe((st, prevSt) => {
@@ -414,6 +506,19 @@ export function SyntheticVisionView({ vehicle, isPrimary, osd, onActivate, strea
     sceneRef.current = scene;
     const cam = useCameraStore.getState();
     scene.setBuildingStyle({ roofImagery: cam.svtRoofImagery, facades: cam.svtFacades });
+    scene.setGoogle3dTiles({
+      enabled: cam.google3dTiles,
+      apiKey: cam.googleMapsApiKey,
+      maxScreenSpaceError: cam.svtQuality === 'high' ? 10 : cam.svtQuality === 'low' ? 26 : 16,
+      onStatusChange: (st, msg) => {
+        setG3dStatus(st);
+        setG3dErrorMsg(msg);
+        dirtyRef.current = true;
+      },
+      onAttributionChange: (attr) => {
+        if (attr) setG3dAttribution(`Google · ${attr}`);
+      },
+    });
     setSvtFov(scene.getFov());
 
     let lastWidth = 0;
@@ -465,6 +570,128 @@ export function SyntheticVisionView({ vehicle, isPrimary, osd, onActivate, strea
       const shown: SvtPose | null = pos && att
         ? { ...pos, ...att, eyeMsl: pos.altMsl + datumOffsetRef.current, eyeFloorM: eyeFloorRef.current }
         : null;
+
+      // ─── Peer SITL / Fleet Vehicles (enabled with 3D GLB toggle) ──────────
+      const customGlbEnabled = useSceneMeshStore.getState().enabled;
+      if (!customGlbEnabled) {
+        if (hadPeersRef.current) {
+          hadPeersRef.current = false;
+          peerSmoothRef.current.clear();
+          scene.setPeerVehicles?.([], 0);
+          dirtyRef.current = true;
+        }
+      } else {
+        const known = Object.values(useActiveVehicleStore.getState().knownVehicles);
+        const byVehicle = useFleetTelemetryStore.getState().byVehicle;
+        const overrides = useVehicleAppearanceStore.getState().overrides;
+        const curKey = vehicleKeyRef.current;
+        const curSysid = ownSysidRef.current;
+        const peers: SvtPeerVehicle[] = [];
+        const activePeerKeys = new Set<string>();
+
+        for (const v of known) {
+          if (curKey ? v.key === curKey : (curSysid != null && v.sysid === curSysid)) continue;
+          const tel = byVehicle[v.key];
+          if (!tel) continue;
+          const g = tel.gps;
+          const p = tel.position;
+          let peerLat = 0;
+          let peerLon = 0;
+          if (g && (g.fixType ?? 0) >= 2 && (g.lat !== 0 || g.lon !== 0)) {
+            peerLat = g.lat;
+            peerLon = g.lon;
+          } else if (p && (p.lat !== 0 || p.lon !== 0)) {
+            peerLat = p.lat;
+            peerLon = p.lon;
+          } else {
+            continue;
+          }
+
+          activePeerKeys.add(v.key);
+          const rawPos: PosSample = {
+            lat: peerLat,
+            lon: peerLon,
+            altMsl: p?.alt ?? 0,
+            agl: p?.relativeAlt ?? 0,
+            vN: p?.vx ?? 0,
+            vE: p?.vy ?? 0,
+            vD: p?.vz ?? 0,
+          };
+          const rawAtt: AttSample = {
+            rollDeg: tel.attitude?.roll ?? 0,
+            pitchDeg: tel.attitude?.pitch ?? 0,
+            headingDeg: headingFrom(tel.attitude?.yaw ?? 0, tel.vfrHud?.heading ?? 0),
+            rollRate: tel.attitude?.rollSpeed ?? 0,
+            pitchRate: tel.attitude?.pitchSpeed ?? 0,
+            yawRate: tel.attitude?.yawSpeed ?? 0,
+          };
+
+          let st = peerSmoothRef.current.get(v.key);
+          if (!st) {
+            st = {
+              lastUpdateWall: tel.lastUpdate,
+              posSample: { t: now, v: rawPos },
+              attSample: { t: now, v: rawAtt },
+              shownPos: rawPos,
+              shownAtt: rawAtt,
+            };
+            peerSmoothRef.current.set(v.key, st);
+          } else if (tel.lastUpdate !== st.lastUpdateWall) {
+            st.lastUpdateWall = tel.lastUpdate;
+            st.posSample = { t: now, v: rawPos };
+            st.attSample = { t: now, v: rawAtt };
+          }
+
+          const dtPos = Math.min(0.5, Math.max(0, (now - st.posSample.t) / 1000));
+          const predPos: PosSample = {
+            ...st.posSample.v,
+            ...predictPosition(st.posSample.v, dtPos, M_PER_DEG_LAT, metersPerDegLon(st.posSample.v.lat)),
+          };
+          st.shownPos = approxDistanceM(st.shownPos.lat, st.shownPos.lon, predPos.lat, predPos.lon) <= SNAP_DIST_M
+            ? blendPos(st.shownPos, predPos, 1 - Math.exp(-frameDt / POS_BLEND_TAU_S))
+            : predPos;
+
+          const dtAtt = Math.min(0.25, Math.max(0, (now - st.attSample.t) / 1000));
+          const eRates = eulerRatesFromBody(st.attSample.v.rollDeg, st.attSample.v.pitchDeg, {
+            p: st.attSample.v.rollRate,
+            q: st.attSample.v.pitchRate,
+            r: st.attSample.v.yawRate,
+          });
+          const predAtt: AttSample = {
+            ...st.attSample.v,
+            rollDeg: predictAngle(st.attSample.v.rollDeg, eRates.rollRate, dtAtt),
+            pitchDeg: predictAngle(st.attSample.v.pitchDeg, eRates.pitchRate, dtAtt),
+            headingDeg: predictAngle(st.attSample.v.headingDeg, eRates.yawRate, dtAtt),
+          };
+          st.shownAtt = lerpAtt(st.shownAtt, predAtt, 1 - Math.exp(-frameDt / ATT_BLEND_TAU_S));
+
+          peers.push({
+            id: v.key,
+            label: `SYS ${v.sysid}`,
+            color: resolveVehicleColor(overrides, v.key, v.sysid),
+            vehicleClass: getVehicleClass(v.mavType),
+            lat: st.shownPos.lat,
+            lon: st.shownPos.lon,
+            altMsl: st.shownPos.altMsl,
+            agl: st.shownPos.agl,
+            rollDeg: st.shownAtt.rollDeg,
+            pitchDeg: st.shownAtt.pitchDeg,
+            headingDeg: st.shownAtt.headingDeg,
+            armed: tel.flight?.armed ?? false,
+          });
+        }
+
+        for (const k of peerSmoothRef.current.keys()) {
+          if (!activePeerKeys.has(k)) peerSmoothRef.current.delete(k);
+        }
+
+        if (peers.length > 0 || hadPeersRef.current) {
+          scene.setPeerVehicles?.(peers, datumOffsetRef.current);
+          hadPeersRef.current = peers.length > 0;
+          dirtyRef.current = true;
+        }
+      }
+
       const was = shownRef.current;
       const moved =
         (shown === null) !== (was === null) ||
@@ -560,6 +787,7 @@ export function SyntheticVisionView({ vehicle, isPrimary, osd, onActivate, strea
   // Module meshes ride the terrain grid; re-place them on every mesh or terrain change.
   useEffect(() => {
     sceneRef.current?.setMeshes(meshesFor('svt'));
+    dirtyRef.current = true;
   }, [meshVersion, terrainVersion, terrainStatus]);
 
   // ─── Satellite drape ──────────────────────────────────────────────────────
@@ -639,7 +867,8 @@ export function SyntheticVisionView({ vehicle, isPrimary, osd, onActivate, strea
       try {
         const list = await loadBuildings(buildingsSource, lat, lon);
         if (token !== buildingsTokenRef.current) return;
-        sceneRef.current?.setBuildings(buildBuildingsGeometry(list, grid, { lat, lon }));
+        const customOrigins = meshesFor('svt').map((m) => m.origin);
+        sceneRef.current?.setBuildings(buildBuildingsGeometry(list, grid, { lat, lon }, undefined, customOrigins));
         buildingsShownRef.current = buildingsSource;
         setBuildingsStatus('ready');
         dirtyRef.current = true;
@@ -649,7 +878,7 @@ export function SyntheticVisionView({ vehicle, isPrimary, osd, onActivate, strea
       }
     })();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [buildingsSource, drapeGrid, buildingsLatKey, buildingsLonKey]);
+  }, [buildingsSource, drapeGrid, buildingsLatKey, buildingsLonKey, meshVersion]);
 
   const overlayAttitude = att ? { roll: att.roll, pitch: att.pitch } : null;
   // The 3D scene already shows a true banked horizon — drop the flat cyan line.
@@ -710,7 +939,80 @@ export function SyntheticVisionView({ vehicle, isPrimary, osd, onActivate, strea
           {t('camera:svt.loadingTerrain')}
         </div>
       )}
-      {position && buildingsSource !== 'off' && (
+      {google3dTiles && (!googleMapsApiKey || g3dStatus === 'error') && (
+        <div
+          className="absolute left-1/2 top-10 z-20 flex -translate-x-1/2 flex-col gap-1.5 rounded-lg border border-sky-500/40 bg-slate-900/90 p-2.5 text-xs text-white shadow-xl backdrop-blur-md"
+          onClick={(e) => e.stopPropagation()}
+        >
+          <div className="flex items-center justify-between gap-4">
+            {/* i18n-exempt */}
+            <span className="font-semibold text-sky-300">Google Map Tiles API — Photorealistic 3D Tiles</span>
+            <button
+              type="button"
+              onClick={() => setGoogle3dTiles(false)}
+              className="text-[11px] text-white/60 hover:text-white"
+            >
+              ✕
+            </button>
+          </div>
+          {g3dStatus === 'error' && g3dErrorMsg && (
+            <div className="flex items-center justify-between gap-2 text-[11px] text-amber-300">
+              {/* i18n-exempt */}
+              <span>載入失敗：{g3dErrorMsg}</span>
+              {googleMapsApiKey && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    setGoogleMapsApiKey('');
+                    setDraftApiKey('');
+                  }}
+                  className="shrink-0 rounded border border-rose-400/40 bg-rose-500/20 px-1.5 py-0.5 text-[10px] text-rose-200 hover:bg-rose-500/30"
+                >
+                  {/* i18n-exempt */}
+                  清除舊 Key
+                </button>
+              )}
+            </div>
+          )}
+          <div className="flex items-center gap-1.5">
+            <input
+              type="password"
+              value={draftApiKey}
+              onChange={(e) => setDraftApiKey(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter' && draftApiKey.trim()) {
+                  setGoogleMapsApiKey(draftApiKey.trim());
+                }
+              }}
+              placeholder="貼上 Google Map Tiles API Key..." // i18n-exempt
+              className="w-60 rounded border border-white/20 bg-black/60 px-2 py-1 text-[11px] font-mono text-white focus:border-sky-400 focus:outline-none"
+            />
+            <button
+              type="button"
+              onClick={() => {
+                if (draftApiKey.trim()) setGoogleMapsApiKey(draftApiKey.trim());
+              }}
+              className="rounded bg-sky-600 px-2.5 py-1 text-[11px] font-medium text-white hover:bg-sky-500"
+            >
+              {/* i18n-exempt */}
+              套用並載入
+            </button>
+          </div>
+        </div>
+      )}
+      {position && google3dTiles && g3dStatus === 'loading' && (
+        <div className="absolute bottom-8 left-2 flex items-center gap-2 rounded bg-black/55 px-2 py-1 text-[11px] text-sky-300">
+          <div className="h-3 w-3 animate-spin rounded-full border-2 border-sky-400/30 border-t-sky-300" />
+          {/* i18n-exempt */}
+          載入 Google 3D Tiles...
+        </div>
+      )}
+      {position && google3dTiles && g3dStatus === 'ready' && (
+        <div className="absolute bottom-1 right-2 text-[9px] text-white/60">
+          {g3dAttribution}
+        </div>
+      )}
+      {position && !google3dTiles && buildingsSource !== 'off' && (
         <div className={`absolute bottom-1 right-2 text-[9px] ${buildingsStatus === 'error' ? 'text-amber-300' : 'text-white/50'}`}>
           {buildingsStatus === 'error' ? t('camera:svt.buildingsUnavailable') : t('camera:svt.osmCredit')}
         </div>

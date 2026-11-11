@@ -38,7 +38,7 @@ interface FleetTelemetryStore {
   clear: () => void;
 }
 
-const FLUSH_MS = 150;
+const FLUSH_MS = 30;
 
 export const useFleetTelemetryStore = create<FleetTelemetryStore>((set, get) => {
   let pending: Record<string, VehicleTelemetry> = {};

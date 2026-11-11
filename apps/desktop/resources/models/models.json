@@ -1,0 +1,29 @@
+[
+  {
+    "id": "taipei-101",
+    "name": "台北 101 (Taipei 101)",
+    "file": "taipei101.glb",
+    "enabled": true,
+    "origin": {
+      "lat": 25.033964,
+      "lng": 121.564468,
+      "altMsl": 12
+    },
+    "yawDeg": 0,
+    "scenes": ["svt", "mission3d"]
+  },
+  {
+    "id": "cks-memorial",
+    "name": "中正紀念堂 (CKS Memorial Hall)",
+    "file": "cks-memorial.glb",
+    "enabled": true,
+    "origin": {
+      "lat": 25.034696,
+      "lng": 121.521867,
+      "altMsl": 9
+    },
+    "yawDeg": 302,
+    "scenes": ["svt", "mission3d"]
+  }
+]
+

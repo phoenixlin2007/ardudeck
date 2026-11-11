@@ -254,6 +254,8 @@ export function Mission3DPanel({
   const meshLayerRef = useRef<MeshThreeJsLayer | null>(null);
   const terrainVersion = useTileSourceStore((s) => s.version);
   const meshVersion = useSceneMeshStore((s) => s.version);
+  const customGlbEnabled = useSceneMeshStore((s) => s.enabled);
+  const toggleCustomGlb = useSceneMeshStore((s) => s.toggleEnabled);
   const markerContainerRef = useRef<HTMLDivElement>(null);
   const isInitialFitDone = useRef(false);
 
@@ -1069,6 +1071,18 @@ export function Mission3DPanel({
           onToggleTerrain={() => setShowHeight((v) => !v)}
           showOverlays={false}
         />
+        <button
+          onClick={toggleCustomGlb}
+          title="顯示 / 隱藏自訂 3D GLB 模型 (Toggle Custom 3D GLB Landmarks)" // i18n-exempt
+          className={`px-2.5 py-1.5 rounded-lg text-xs font-medium shadow-lg border transition-colors ${
+            customGlbEnabled
+              ? 'bg-emerald-600 border-emerald-500 text-white'
+              : 'bg-surface-raised border-subtle text-content-secondary hover:text-content'
+          }`}
+        >
+          {/* i18n-exempt */}
+          3D GLB
+        </button>
         {toolbarContent}
       </div>
 

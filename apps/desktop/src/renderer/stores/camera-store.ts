@@ -60,6 +60,10 @@ interface CameraState {
   svtFacades: boolean;
   /** Synthetic-vision terrain detail (never the near-field imagery). */
   svtQuality: SvtQuality;
+  /** Render Google Map Tiles API Photorealistic 3D Tiles in the 3D scene. */
+  google3dTiles: boolean;
+  /** Google Map Tiles API Key used for Photorealistic 3D Tiles (`root.json?key=...`). */
+  googleMapsApiKey: string;
   /** Pin this window to one vehicle, ignoring the active selection. Null = follow. */
   lockedVehicleKey: string | null;
   osd: OsdLayers;
@@ -93,6 +97,9 @@ interface CameraState {
   setSvtBuildings: (source: SvtBuildings) => void;
   setSvtRoofImagery: (on: boolean) => void;
   setSvtFacades: (on: boolean) => void;
+  setGoogle3dTiles: (on: boolean) => void;
+  toggleGoogle3dTiles: () => void;
+  setGoogleMapsApiKey: (key: string) => void;
   setLockedVehicle: (vehicleKey: string | null) => void;
   toggleOsd: (layer: keyof OsdLayers) => void;
   setGridCols: (cols: number) => void;
@@ -124,6 +131,8 @@ export const useCameraStore = create<CameraState>()(
       svtRoofImagery: true,
       svtFacades: true,
       svtQuality: 'medium',
+      google3dTiles: false,
+      googleMapsApiKey: (import.meta as unknown as { env?: Record<string, string> }).env?.VITE_GOOGLE_MAPS_API_KEY ?? '',
       lockedVehicleKey: null,
       osd: { ...DEFAULT_OSD_LAYERS },
       gridCols: 2,
@@ -218,6 +227,9 @@ export const useCameraStore = create<CameraState>()(
       setSvtBuildings: (svtBuildings) => set({ svtBuildings: validBuildings(svtBuildings) }),
       setSvtRoofImagery: (svtRoofImagery) => set({ svtRoofImagery }),
       setSvtFacades: (svtFacades) => set({ svtFacades }),
+      setGoogle3dTiles: (google3dTiles) => set({ google3dTiles }),
+      toggleGoogle3dTiles: () => set((s) => ({ google3dTiles: !s.google3dTiles })),
+      setGoogleMapsApiKey: (googleMapsApiKey) => set({ googleMapsApiKey: googleMapsApiKey.trim() }),
       setLockedVehicle: (lockedVehicleKey) => set({ lockedVehicleKey }),
       toggleOsd: (layer) => set((s) => ({ osd: { ...s.osd, [layer]: !s.osd[layer] } })),
       setGridCols: (gridCols) => set({ gridCols: Math.max(1, Math.min(4, gridCols)) }),
@@ -266,6 +278,8 @@ export const useCameraStore = create<CameraState>()(
         svtRoofImagery: s.svtRoofImagery,
         svtFacades: s.svtFacades,
         svtQuality: s.svtQuality,
+        google3dTiles: s.google3dTiles,
+        googleMapsApiKey: s.googleMapsApiKey,
         osd: s.osd,
         gridCols: s.gridCols,
         gimbalByVehicle: s.gimbalByVehicle,

@@ -15,6 +15,7 @@ import { TILE_CACHE_SCHEME_PRIVILEGES, setupTileCacheProtocol, setupTileCacheHan
 import { setupBuildingCacheHandlers } from './building-cache.js';
 import { MODULE_SCHEME_PRIVILEGES, setupModuleProtocol } from './modules/module-protocol.js';
 import { ASSET_SCHEME_PRIVILEGES, setupAssetProtocol } from './terrain/asset-protocol.js';
+import { setupCustomModelsLoader } from './terrain/custom-models-loader.js';
 import { MEDIA_SCHEME_PRIVILEGES, setupMediaProtocol } from './media/media-library.js';
 import { setupDeepLinks, handleStartupArgs, flushPendingDeepLink, deliverDeepLinkUrl } from './modules/deep-link.js';
 import { initWindowManager, restoreDetachedWindows, setupWindowManagerIpc, getMainFullScreen, setMainFullScreen, registerSecondaryWindow } from './window-manager.js';
@@ -443,6 +444,7 @@ app.whenReady().then(() => {
   setupAppIpc(mainWindow);
   setupTileCacheHandlers(mainWindow);
   setupBuildingCacheHandlers(mainWindow);
+  setupCustomModelsLoader();
 
   splashSetStatus(splash, t('main:mainIndex.splashInitializing'));
 

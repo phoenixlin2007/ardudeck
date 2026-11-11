@@ -5,7 +5,7 @@
  *  - Follow: shows the active vehicle's live feed and auto-switches when the
  *    fleet selection changes. A lock pin freezes the panel to one vehicle, so
  *    you can pop out several windows and lock each = a video wall.
- *  - Grid: tiles every vehicle that has a configured feed; the active one is
+ *  - Grid: tiles every vehicle that has a configured fELECTRON_RUN_AS_NODE= pnpm starteed; the active one is
  *    highlighted and clicking a tile makes that vehicle active.
  *
  * The detach/pin/dock-back chrome and theme sync come from the existing
@@ -14,8 +14,9 @@
 
 import { useEffect, useMemo, useState } from 'react';
 import { SvtImageryPicker, SvtBuildingsPicker } from './svt/SvtImageryPicker';
-import { Camera, Circle, Film, Layers, RotateCw, SlidersHorizontal } from 'lucide-react';
+import { Box, Camera, Circle, Film, Globe, Layers, RotateCw, SlidersHorizontal } from 'lucide-react';
 import { useActiveVehicleStore } from '../../stores/active-vehicle-store';
+import { useSceneMeshStore } from '../../stores/scene-mesh-store';
 import { useFleetVehicles, type FleetVehicle } from '../../hooks/useFleet';
 import { useCameraStore } from '../../stores/camera-store';
 import type { OsdLayers, CameraRenderMode } from '../../../shared/camera-types';
@@ -71,6 +72,8 @@ export function CameraPanel() {
   const fleet = useFleetVehicles();
 
   const store = useCameraStore();
+  const customGlbEnabled = useSceneMeshStore((s) => s.enabled);
+  const toggleCustomGlb = useSceneMeshStore((s) => s.toggleEnabled);
   const { viewMode, renderMode, syntheticFallback, lockedVehicleKey, osd, gridCols } = store;
 
   const [showSources, setShowSources] = useState(false);
@@ -245,6 +248,35 @@ export function CameraPanel() {
             </span>
           )}
         </button>
+
+        {renderMode === 'synthetic' && (
+          <>
+            <button
+              onClick={store.toggleGoogle3dTiles}
+              className={`flex items-center gap-1 rounded px-1.5 py-0.5 text-[11px] font-medium transition-colors ${store.google3dTiles
+                  ? 'bg-sky-500/20 text-sky-300 border border-sky-500/40'
+                  : 'text-content-secondary hover:bg-surface-raised border border-transparent'
+                }`}
+              title="啟用 / 停用 Google Map Tiles API Photorealistic 3D Tiles" // i18n-exempt
+            >
+              <Globe className="h-3 w-3" />
+              {/* i18n-exempt */}
+              Google 3D
+            </button>
+            <button
+              onClick={toggleCustomGlb}
+              className={`flex items-center gap-1 rounded px-1.5 py-0.5 text-[11px] font-medium transition-colors ${customGlbEnabled
+                  ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/40'
+                  : 'text-content-secondary hover:bg-surface-raised border border-transparent'
+                }`}
+              title="顯示 / 隱藏自訂 3D GLB 模型 (Toggle Custom 3D GLB Landmarks)" // i18n-exempt
+            >
+              <Box className="h-3 w-3" />
+              {/* i18n-exempt */}
+              3D GLB
+            </button>
+          </>
+        )}
 
         {renderMode === 'synthetic' && <VisionStreamControl />}
 
