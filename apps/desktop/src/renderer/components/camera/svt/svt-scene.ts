@@ -269,6 +269,7 @@ export function createSvtScene(canvas: HTMLCanvasElement): SvtScene {
         const y = Number.isFinite(groundY) ? Math.max(e.origin.altMsl, groundY) : e.origin.altMsl;
         g.position.set(x, y, z);
         g.rotation.y = -((e.yawDeg ?? 0) * Math.PI) / 180;
+        g.visible = !google3d.hasLoadedTiles();
       };
       const existing = meshGroups.get(k);
       if (existing) {
@@ -614,6 +615,7 @@ export function createSvtScene(canvas: HTMLCanvasElement): SvtScene {
     if (buildingsMesh) buildingsMesh.visible = !has3d;
     if (terrainGrid) terrainGrid.visible = !has3d;
     if (terrainMesh) terrainMesh.position.y = has3d ? -28 : 0;
+    for (const g of meshGroups.values()) g.visible = !has3d;
   };
   const google3d = createGoogle3dTilesController({
     onStatusChange: (st, msg) => {

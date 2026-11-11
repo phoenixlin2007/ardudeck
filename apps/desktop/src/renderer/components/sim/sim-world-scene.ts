@@ -439,6 +439,9 @@ export function createSimWorldScene(canvas: HTMLCanvasElement): SimWorldScene {
   let terrainBaseYOffset = 0;
   let simViewportHeight = 720;
 
+  const customMeshGroups = new Map<string, THREE.Group>();
+  const customMeshUrls = new Map<string, { url: string; version: number }>();
+
   let g3dStatusCb: ((status: Google3dTilesStatus, message?: string) => void) | undefined;
   let g3dAttrCb: ((attribution: string) => void) | undefined;
   const syncSimGroundWith3dTiles = () => {
@@ -453,6 +456,9 @@ export function createSimWorldScene(canvas: HTMLCanvasElement): SimWorldScene {
     } else {
       ground.visible = true;
       (scene.fog as THREE.Fog).far = DEFAULT_FOG_FAR;
+    }
+    for (const g of customMeshGroups.values()) {
+      g.visible = !has3d && (g.userData as { inRange?: boolean }).inRange !== false;
     }
   };
   const google3d = createGoogle3dTilesController({
@@ -486,9 +492,6 @@ export function createSimWorldScene(canvas: HTMLCanvasElement): SimWorldScene {
     grid.visible = gridEnabled;
   }
 
-  const customMeshGroups = new Map<string, THREE.Group>();
-  const customMeshUrls = new Map<string, { url: string; version: number }>();
-
   function setMeshes(entries: SceneMeshEntry[], origin: { lat: number; lon: number } | null, elevGrid?: ElevationGrid | null): void {
     const wanted = new Set(entries.map((e) => `${e.key}@${e.version ?? 0}`));
     for (const [k, g] of customMeshGroups) {
@@ -511,11 +514,13 @@ export function createSimWorldScene(canvas: HTMLCanvasElement): SimWorldScene {
       const place = (g: THREE.Group) => {
         const east = (e.origin.lng - origin.lon) * mPerDegLon;
         const north = (e.origin.lat - origin.lat) * 111_320;
-        if (Math.hypot(east, north) > 8_000) {
+        const inRange = Math.hypot(east, north) <= 8_000;
+        (g.userData as { inRange?: boolean }).inRange = inRange;
+        if (!inRange) {
           g.visible = false;
           return;
         }
-        g.visible = true;
+        g.visible = !google3d.hasLoadedTiles();
         let y = 0;
         if (elevGrid) {
           const groundMsl = sampleElevation(elevGrid, e.origin.lat, e.origin.lng);

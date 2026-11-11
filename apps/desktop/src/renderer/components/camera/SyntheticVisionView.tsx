@@ -571,9 +571,9 @@ export function SyntheticVisionView({ vehicle, isPrimary, osd, onActivate, strea
         ? { ...pos, ...att, eyeMsl: pos.altMsl + datumOffsetRef.current, eyeFloorM: eyeFloorRef.current }
         : null;
 
-      // ─── Peer SITL / Fleet Vehicles (enabled with 3D GLB toggle) ──────────
-      const customGlbEnabled = useSceneMeshStore.getState().enabled;
-      if (!customGlbEnabled) {
+      // ─── Peer SITL / Fleet Vehicles (enabled with 3D GLB or Google 3D toggle) ─
+      const showPeerVehicles = useSceneMeshStore.getState().enabled || useCameraStore.getState().google3dTiles;
+      if (!showPeerVehicles) {
         if (hadPeersRef.current) {
           hadPeersRef.current = false;
           peerSmoothRef.current.clear();
