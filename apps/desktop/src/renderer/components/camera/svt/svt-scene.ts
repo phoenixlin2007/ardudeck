@@ -119,6 +119,7 @@ export interface SvtScene {
     maxScreenSpaceError?: number;
     onStatusChange?: (status: Google3dTilesStatus, message?: string) => void;
     onAttributionChange?: (attribution: string) => void;
+    onDirty?: () => void;
   }) => void;
   /** Position + orient the camera from a vehicle pose. */
   setPose: (pose: SvtPose) => void;
@@ -610,6 +611,7 @@ export function createSvtScene(canvas: HTMLCanvasElement): SvtScene {
   // ─── Google Map Tiles API Photorealistic 3D Tiles ─────────────────────────
   let g3dStatusCb: ((status: Google3dTilesStatus, message?: string) => void) | undefined;
   let g3dAttrCb: ((attribution: string) => void) | undefined;
+  let g3dDirtyCb: (() => void) | undefined;
   const syncTerrainBackdropWith3dTiles = () => {
     const has3d = google3d.hasLoadedTiles();
     if (buildingsMesh) buildingsMesh.visible = !has3d;
@@ -621,13 +623,14 @@ export function createSvtScene(canvas: HTMLCanvasElement): SvtScene {
     onStatusChange: (st, msg) => {
       syncTerrainBackdropWith3dTiles();
       g3dStatusCb?.(st, msg);
+      g3dDirtyCb?.();
     },
     onAttributionChange: (attr) => {
       g3dAttrCb?.(attr);
     },
     onDirty: () => {
       syncTerrainBackdropWith3dTiles();
-      if (!contextLost) renderer.render(scene, camera);
+      g3dDirtyCb?.();
     },
   });
   scene.add(google3d.group);
@@ -690,6 +693,8 @@ export function createSvtScene(canvas: HTMLCanvasElement): SvtScene {
     setGoogle3dTiles(opts) {
       g3dStatusCb = opts.onStatusChange;
       g3dAttrCb = opts.onAttributionChange;
+      g3dDirtyCb = opts.onDirty;
+      renderer.setPixelRatio(Math.min(window.devicePixelRatio, opts.enabled ? 1.25 : 2));
       google3d.configure({
         enabled: opts.enabled,
         apiKey: opts.apiKey,

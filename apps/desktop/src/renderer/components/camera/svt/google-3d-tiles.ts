@@ -5,12 +5,11 @@
  * `https://tile.googleapis.com/v1/3dtiles/root.json?key=YOUR_API_KEY`:
  *  - Propagates Google's `session` token and `key` across child `.json` & `.glb` URIs.
  *  - Decodes `.glb` payloads with Three.js `GLTFLoader` + `DRACOLoader`.
- *  - Transforms WGS84 ECEF coordinates into ArduDeck's local East-Up-South
- *    (`three.x = East, three.y = Up (MSL + mslOffsetY), three.z = -North`) frame
- *    with 64-bit Relative-To-Center (RTC) vertex recentering to eliminate 32-bit
- *    WebGL float jitter.
- *  - Applies EGM96 geoid undulation so WGS84 ellipsoid heights in Google 3D Tiles
- *    align with Mean Sea Level (MSL) terrain & telemetry altitudes.
+ *  - Zero-vertex-loop 64-bit Relative-To-Center (RTC) matrix composition: keeps vertex
+ *    buffers untouched on the GPU while cancelling large ECEF translations in 64-bit
+ *    JavaScript `Matrix4` math before uploading `modelViewMatrix` to WebGL.
+ *  - Performs camera frustum culling (`THREE.Frustum`) + Screen-Space Error (SSE) LOD
+ *    selection and staggered `.glb` instantiation for smooth 60 FPS flight.
  */
 
 import * as THREE from 'three';
@@ -61,15 +60,11 @@ export function geodeticToEcef(latDeg: number, lonDeg: number, heightM: number):
  * spherical harmonic approximation globally so 3D Tiles sit at true MSL height.
  */
 export function egm96GeoidUndulationM(latDeg: number, lonDeg: number): number {
-  // High-accuracy bilinear model over Taiwan (21.5°N–25.8°N, 119.5°E–122.5°E)
-  // where EGM96 geoid height ranges from ~18.5 m (west/north) to ~22.5 m (east coast).
   if (latDeg >= 21.0 && latDeg <= 26.0 && lonDeg >= 119.0 && lonDeg <= 123.0) {
     const dLat = latDeg - 25.0375;
     const dLon = lonDeg - 121.5637;
-    // At Taipei (25.0375°N, 121.5637°E), N_EGM96 ≈ +19.3 m
     return 19.3 - 0.35 * dLat + 1.15 * dLon;
   }
-  // Compact global low-order geoid undulation approximation (metres)
   const phi = latDeg * DEG;
   const lam = lonDeg * DEG;
   const cosPhi = Math.cos(phi);
@@ -110,6 +105,12 @@ interface RawTilesetJson {
   root: RawTileNode;
 }
 
+interface PreparedMeshEntry {
+  mesh: THREE.Mesh;
+  /** 64-bit matrix mapping from the mesh's (RTC-centered) local space to WGS84 ECEF. */
+  meshToEcef: THREE.Matrix4;
+}
+
 interface TileNode {
   id: string;
   centerEcef: [number, number, number];
@@ -123,6 +124,7 @@ interface TileNode {
   children: TileNode[];
   state: 'unloaded' | 'loading' | 'loaded' | 'failed';
   group: THREE.Group | null;
+  entries: PreparedMeshEntry[];
   lastVisitedFrame: number;
 }
 
@@ -162,17 +164,18 @@ function computeBoundingSphere(
   transform: THREE.Matrix4,
 ): { centerEcef: [number, number, number]; radiusM: number } {
   const vCenter = new THREE.Vector3();
-  const vAxis = new THREE.Vector3();
 
   if (bv.box && bv.box.length >= 12) {
     vCenter.set(bv.box[0]!, bv.box[1]!, bv.box[2]!).applyMatrix4(transform);
     let rSq = 0;
+    const te = transform.elements;
     for (let i = 3; i < 12; i += 3) {
-      vAxis.set(bv.box[i]!, bv.box[i + 1]!, bv.box[i + 2]!).transformDirection(transform);
-      // Scale by transform's column lengths as well
-      const sx = bv.box[i]! * transform.elements[0]! + bv.box[i + 1]! * transform.elements[4]! + bv.box[i + 2]! * transform.elements[8]!;
-      const sy = bv.box[i]! * transform.elements[1]! + bv.box[i + 1]! * transform.elements[5]! + bv.box[i + 2]! * transform.elements[9]!;
-      const sz = bv.box[i]! * transform.elements[2]! + bv.box[i + 1]! * transform.elements[6]! + bv.box[i + 2]! * transform.elements[10]!;
+      const bx = bv.box[i]!;
+      const by = bv.box[i + 1]!;
+      const bz = bv.box[i + 2]!;
+      const sx = bx * te[0]! + by * te[4]! + bz * te[8]!;
+      const sy = bx * te[1]! + by * te[5]! + bz * te[9]!;
+      const sz = bx * te[2]! + by * te[6]! + bz * te[10]!;
       rSq += sx * sx + sy * sy + sz * sz;
     }
     return { centerEcef: [vCenter.x, vCenter.y, vCenter.z], radiusM: Math.sqrt(rSq) };
@@ -246,20 +249,20 @@ export function createGoogle3dTilesController(callbacks: Google3dTilesCallbacks 
 
   let enabled = false;
   let apiKey = '';
-  let maxSSE = 16;
-  let maxRangeM = 4500;
-  const maxConcurrent = 8;
+  let maxSSE = 28;
+  let maxRangeM = 2800;
+  const maxConcurrent = 5;
 
   let originLat: number | null = null;
   let originLon: number | null = null;
   let mslOffsetY = 0;
 
-  // ECEF <-> Local Three.js (East, Up, South) transformation state
+  // ECEF <-> Local Three.js (East, Up, South) transformation state (64-bit float)
   let originEcef: [number, number, number] = [0, 0, 0];
   let eastVec: [number, number, number] = [1, 0, 0];
   let upVec: [number, number, number] = [0, 1, 0];
   let southVec: [number, number, number] = [0, 0, 1];
-  const ecefToLocalRot = new THREE.Matrix4();
+  const ecefToLocalMat = new THREE.Matrix4();
 
   let sessionToken: string | null = null;
   let rootNode: TileNode | null = null;
@@ -276,9 +279,15 @@ export function createGoogle3dTilesController(callbacks: Google3dTilesCallbacks 
 
   let lastCamUpdatePos = new THREE.Vector3(Infinity, Infinity, Infinity);
   let lastCamUpdateRot = new THREE.Euler();
+  let lastTraversalTime = 0;
   let pendingTraversalTimer: ReturnType<typeof setTimeout> | null = null;
   let lastCameraRef: THREE.PerspectiveCamera | null = null;
   let lastViewportHeight = 720;
+
+  // Reusable math objects for frustum culling
+  const projScreenMatrix = new THREE.Matrix4();
+  const frustum = new THREE.Frustum();
+  const tmpSphere = new THREE.Sphere();
 
   const setStatus = (next: Google3dTilesStatus, msg?: string) => {
     if (currentStatus === next && !msg) return;
@@ -286,10 +295,16 @@ export function createGoogle3dTilesController(callbacks: Google3dTilesCallbacks 
     callbacks.onStatusChange?.(next, msg);
   };
 
+  const updateNodeLocalMatrices = (node: TileNode) => {
+    for (const entry of node.entries) {
+      entry.mesh.matrix.multiplyMatrices(ecefToLocalMat, entry.meshToEcef);
+      entry.mesh.matrixWorldNeedsUpdate = true;
+    }
+  };
+
   const recomputeOriginBasis = () => {
     if (originLat === null || originLon === null) return;
     const geoidM = egm96GeoidUndulationM(originLat, originLon);
-    // Reference ellipsoid height h0 such that (h_ellipsoid - h0) == H_MSL + mslOffsetY
     const h0 = geoidM - mslOffsetY;
     originEcef = geodeticToEcef(originLat, originLon, h0);
 
@@ -302,29 +317,26 @@ export function createGoogle3dTilesController(callbacks: Google3dTilesCallbacks 
 
     eastVec = [-sinLam, cosLam, 0];
     upVec = [cosPhi * cosLam, cosPhi * sinLam, sinPhi];
-    // South = -North
     southVec = [sinPhi * cosLam, sinPhi * sinLam, -cosPhi];
 
-    // Pure rotation matrix mapping ECEF deltas (dx, dy, dz) -> Local (East, Up, South)
-    ecefToLocalRot.set(
-      eastVec[0], eastVec[1], eastVec[2], 0,
-      upVec[0], upVec[1], upVec[2], 0,
-      southVec[0], southVec[1], southVec[2], 0,
+    // 64-bit affine matrix mapping any ECEF point P -> Local (East, Up, South)
+    const tx = -(eastVec[0] * originEcef[0] + eastVec[1] * originEcef[1] + eastVec[2] * originEcef[2]);
+    const ty = -(upVec[0] * originEcef[0] + upVec[1] * originEcef[1] + upVec[2] * originEcef[2]);
+    const tz = -(southVec[0] * originEcef[0] + southVec[1] * originEcef[1] + southVec[2] * originEcef[2]);
+
+    ecefToLocalMat.set(
+      eastVec[0], eastVec[1], eastVec[2], tx,
+      upVec[0], upVec[1], upVec[2], ty,
+      southVec[0], southVec[1], southVec[2], tz,
       0, 0, 0, 1,
     );
 
-    // Reposition all already-loaded tile groups under the new origin
     for (const node of allLoadedGlbNodes) {
-      if (node.group) {
-        applyEcefToLocalTransform(node.group, node.worldTransform, node.centerEcef);
-      }
+      updateNodeLocalMatrices(node);
     }
     callbacks.onDirty?.();
   };
 
-  /**
-   * Transform a local Three.js coordinate (x = East, y = Up, z = South) back to ECEF.
-   */
   const localToEcef = (local: THREE.Vector3): [number, number, number] => {
     const x = originEcef[0] + eastVec[0] * local.x + upVec[0] * local.y + southVec[0] * local.z;
     const y = originEcef[1] + eastVec[1] * local.x + upVec[1] * local.y + southVec[1] * local.z;
@@ -332,51 +344,28 @@ export function createGoogle3dTilesController(callbacks: Google3dTilesCallbacks 
     return [x, y, z];
   };
 
+  const ecefToLocalPoint = (ecef: [number, number, number], out: THREE.Vector3): THREE.Vector3 => {
+    const dx = ecef[0] - originEcef[0];
+    const dy = ecef[1] - originEcef[1];
+    const dz = ecef[2] - originEcef[2];
+    out.set(
+      eastVec[0] * dx + eastVec[1] * dy + eastVec[2] * dz,
+      upVec[0] * dx + upVec[1] * dy + upVec[2] * dz,
+      southVec[0] * dx + southVec[1] * dy + southVec[2] * dz,
+    );
+    return out;
+  };
+
   /**
-   * Prepare and position a loaded glTF scene so that its vertices sit in local
-   * Three.js coordinates with 64-bit Relative-To-Center (RTC) precision.
+   * Prepare a loaded glTF scene without expensive per-vertex matrix/normal loops.
+   * Uses 64-bit Matrix4 multiplication to cancel Earth-radius ECEF translations.
    */
   const prepareGltfScene = (
     gltfScene: THREE.Group,
     tileWorldTransform: THREE.Matrix4,
     tileCenterEcef: [number, number, number],
-  ): THREE.Group => {
+  ): { wrapper: THREE.Group; entries: PreparedMeshEntry[] } => {
     gltfScene.updateMatrixWorld(true);
-    const rawBox = new THREE.Box3().setFromObject(gltfScene);
-    const rawCenter = rawBox.getCenter(new THREE.Vector3());
-
-    // Auto-detect whether glTF scene needs the standard 3D Tiles Y-up -> Z-up (+90° X) rotation
-    const testWithYUp = rawCenter.clone().applyMatrix4(GLTF_Y_UP_TO_ECEF_Z_UP).applyMatrix4(tileWorldTransform);
-    const testDirect = rawCenter.clone().applyMatrix4(tileWorldTransform);
-    const distYUp = Math.hypot(
-      testWithYUp.x - tileCenterEcef[0],
-      testWithYUp.y - tileCenterEcef[1],
-      testWithYUp.z - tileCenterEcef[2],
-    );
-    const distDirect = Math.hypot(
-      testDirect.x - tileCenterEcef[0],
-      testDirect.y - tileCenterEcef[1],
-      testDirect.z - tileCenterEcef[2],
-    );
-    const needsYUpRotation = distYUp <= distDirect;
-
-    // Extract copyright attribution if present in glTF asset extras
-    const assetCopyright = (gltfScene.userData as { copyright?: string } | undefined)?.copyright;
-    if (assetCopyright) {
-      for (const part of String(assetCopyright).split(';')) {
-        const trimmed = part.trim();
-        if (trimmed) attributions.add(trimmed);
-      }
-      callbacks.onAttributionChange?.(Array.from(attributions).slice(0, 4).join(' · '));
-    }
-
-    // Bake each mesh's internal node transform + RTC offset so vertex coordinates are small
-    // local offsets around (0, 0, 0) in ECEF orientation, avoiding 32-bit float precision loss.
-    const wrapper = new THREE.Group();
-    const rotToEcef = new THREE.Matrix4().copy(tileWorldTransform);
-    if (needsYUpRotation) {
-      rotToEcef.multiply(GLTF_Y_UP_TO_ECEF_Z_UP);
-    }
 
     const meshes: THREE.Mesh[] = [];
     gltfScene.traverse((obj) => {
@@ -384,53 +373,83 @@ export function createGoogle3dTilesController(callbacks: Google3dTilesCallbacks 
       if (m.isMesh) meshes.push(m);
     });
 
-    const vTmp = new THREE.Vector3();
+    // O(1) single-vertex orientation check (glTF Y-up vs ECEF Z-up)
+    let needsYUpRotation = true;
+    const firstMesh = meshes[0];
+    if (firstMesh) {
+      const posAttr = firstMesh.geometry.getAttribute('position') as THREE.BufferAttribute | undefined;
+      if (posAttr && posAttr.count > 0) {
+        const sampleWorld = new THREE.Vector3(posAttr.getX(0), posAttr.getY(0), posAttr.getZ(0)).applyMatrix4(
+          firstMesh.matrixWorld,
+        );
+        const testYUp = sampleWorld.clone().applyMatrix4(GLTF_Y_UP_TO_ECEF_Z_UP).applyMatrix4(tileWorldTransform);
+        const testDirect = sampleWorld.clone().applyMatrix4(tileWorldTransform);
+        const distYUp = Math.hypot(
+          testYUp.x - tileCenterEcef[0],
+          testYUp.y - tileCenterEcef[1],
+          testYUp.z - tileCenterEcef[2],
+        );
+        const distDirect = Math.hypot(
+          testDirect.x - tileCenterEcef[0],
+          testDirect.y - tileCenterEcef[1],
+          testDirect.z - tileCenterEcef[2],
+        );
+        needsYUpRotation = distYUp <= distDirect;
+      }
+    }
+
+    const assetCopyright = (gltfScene.userData as { copyright?: string } | undefined)?.copyright;
+    if (assetCopyright && attributions.size < 6) {
+      for (const part of String(assetCopyright).split(';')) {
+        const trimmed = part.trim();
+        if (trimmed) attributions.add(trimmed);
+      }
+      callbacks.onAttributionChange?.(Array.from(attributions).slice(0, 4).join(' · '));
+    }
+
+    const rotToEcef = new THREE.Matrix4().copy(tileWorldTransform);
+    if (needsYUpRotation) {
+      rotToEcef.multiply(GLTF_Y_UP_TO_ECEF_Z_UP);
+    }
+
+    const wrapper = new THREE.Group();
+    const entries: PreparedMeshEntry[] = [];
+
     for (const mesh of meshes) {
-      mesh.updateWorldMatrix(true, false);
-      // Full matrix from mesh local space -> ECEF
-      const meshToEcef = new THREE.Matrix4().multiplyMatrices(rotToEcef, mesh.matrixWorld);
       const geom = mesh.geometry;
       const posAttr = geom.getAttribute('position') as THREE.BufferAttribute | undefined;
+      const meshToEcef = new THREE.Matrix4().multiplyMatrices(rotToEcef, mesh.matrixWorld);
+
+      // Only if raw vertex buffer itself contains un-centered planetary coordinates (>100 km),
+      // shift in-place by vertex[0] and fold translation into the 64-bit meshToEcef matrix.
       if (posAttr && posAttr.count > 0) {
-        // Compute centroid in 64-bit float in ECEF and recenter positions relative to tileCenterEcef
-        const count = posAttr.count;
-        const nextPositions = new Float32Array(count * 3);
-        const e0 = meshToEcef.elements;
-        for (let i = 0; i < count; i++) {
-          const vx = posAttr.getX(i);
-          const vy = posAttr.getY(i);
-          const vz = posAttr.getZ(i);
-          const ex = e0[0]! * vx + e0[4]! * vy + e0[8]! * vz + e0[12]!;
-          const ey = e0[1]! * vx + e0[5]! * vy + e0[9]! * vz + e0[13]!;
-          const ez = e0[2]! * vx + e0[6]! * vy + e0[10]! * vz + e0[14]!;
-          nextPositions[i * 3] = ex - tileCenterEcef[0];
-          nextPositions[i * 3 + 1] = ey - tileCenterEcef[1];
-          nextPositions[i * 3 + 2] = ez - tileCenterEcef[2];
-        }
-        geom.setAttribute('position', new THREE.BufferAttribute(nextPositions, 3));
-        const normAttr = geom.getAttribute('normal') as THREE.BufferAttribute | undefined;
-        if (normAttr) {
-          const normalMat = new THREE.Matrix3().getNormalMatrix(meshToEcef);
-          for (let i = 0; i < normAttr.count; i++) {
-            vTmp.set(normAttr.getX(i), normAttr.getY(i), normAttr.getZ(i)).applyMatrix3(normalMat).normalize();
-            normAttr.setXYZ(i, vTmp.x, vTmp.y, vTmp.z);
+        const cx = posAttr.getX(0);
+        const cy = posAttr.getY(0);
+        const cz = posAttr.getZ(0);
+        if (cx * cx + cy * cy + cz * cz > 1e10) {
+          const arr = posAttr.array as Float32Array;
+          for (let i = 0; i < arr.length; i += 3) {
+            arr[i]! -= cx;
+            arr[i + 1]! -= cy;
+            arr[i + 2]! -= cz;
           }
-          normAttr.needsUpdate = true;
-        } else {
-          geom.computeVertexNormals();
+          posAttr.needsUpdate = true;
+          meshToEcef.multiply(new THREE.Matrix4().makeTranslation(cx, cy, cz));
         }
-        geom.computeBoundingSphere();
       }
 
-      // Google Photorealistic 3D Tiles have baked sunlight/albedo textures;
-      // use unlit MeshBasicMaterial with the texture so scene lights don't double-darken them.
+      // Convert material to lightweight unlit FrontSide MeshBasicMaterial without mipmap generation stalls
       const convertMat = (m: THREE.Material): THREE.Material => {
         const std = m as THREE.MeshStandardMaterial;
         if (std.map) {
           std.map.colorSpace = THREE.SRGBColorSpace;
+          std.map.generateMipmaps = false;
+          std.map.minFilter = THREE.LinearFilter;
+          std.map.magFilter = THREE.LinearFilter;
           const basic = new THREE.MeshBasicMaterial({
             map: std.map,
-            side: THREE.DoubleSide,
+            side: THREE.FrontSide,
+            toneMapped: false,
           });
           std.dispose();
           return basic;
@@ -442,35 +461,16 @@ export function createGoogle3dTilesController(callbacks: Google3dTilesCallbacks 
         : convertMat(mesh.material);
 
       const cleanMesh = new THREE.Mesh(geom, convertedMat);
+      cleanMesh.matrixAutoUpdate = false;
+      cleanMesh.matrix.multiplyMatrices(ecefToLocalMat, meshToEcef);
+      cleanMesh.matrixWorldNeedsUpdate = true;
       cleanMesh.frustumCulled = true;
+
       wrapper.add(cleanMesh);
+      entries.push({ mesh: cleanMesh, meshToEcef });
     }
 
-    applyEcefToLocalTransform(wrapper, tileWorldTransform, tileCenterEcef);
-    return wrapper;
-  };
-
-  /**
-   * Position + orient a tile wrapper whose vertices are relative to `tileCenterEcef`
-   * in ECEF directions, into the local Three.js (East, Up, South) coordinate system.
-   */
-  const applyEcefToLocalTransform = (
-    wrapper: THREE.Group,
-    _tileWorldTransform: THREE.Matrix4,
-    tileCenterEcef: [number, number, number],
-  ) => {
-    const dx = tileCenterEcef[0] - originEcef[0];
-    const dy = tileCenterEcef[1] - originEcef[1];
-    const dz = tileCenterEcef[2] - originEcef[2];
-
-    const localX = eastVec[0] * dx + eastVec[1] * dy + eastVec[2] * dz;
-    const localY = upVec[0] * dx + upVec[1] * dy + upVec[2] * dz;
-    const localZ = southVec[0] * dx + southVec[1] * dy + southVec[2] * dz;
-
-    wrapper.matrixAutoUpdate = false;
-    wrapper.matrix.copy(ecefToLocalRot);
-    wrapper.matrix.setPosition(localX, localY, localZ);
-    wrapper.matrixWorldNeedsUpdate = true;
+    return { wrapper, entries };
   };
 
   const buildTileNode = (
@@ -513,6 +513,7 @@ export function createGoogle3dTilesController(callbacks: Google3dTilesCallbacks 
       children: [],
       state: contentKind === 'none' ? 'loaded' : 'unloaded',
       group: null,
+      entries: [],
       lastVisitedFrame: 0,
     };
 
@@ -529,7 +530,7 @@ export function createGoogle3dTilesController(callbacks: Google3dTilesCallbacks 
       if (lastCameraRef && enabled) {
         traverseAndSelect(lastCameraRef, lastViewportHeight);
       }
-    }, 60);
+    }, 110);
   };
 
   const loadNodeContent = (node: TileNode, gen: number) => {
@@ -539,7 +540,6 @@ export function createGoogle3dTilesController(callbacks: Google3dTilesCallbacks 
     node.state = 'loading';
     activeRequests++;
 
-    // Ensure the latest API key and session token are attached
     const finalUrl = resolveChildUrl(node.contentUrl, ROOT_ENDPOINT, apiKey, sessionToken).url;
 
     if (node.contentKind === 'json') {
@@ -582,8 +582,9 @@ export function createGoogle3dTilesController(callbacks: Google3dTilesCallbacks 
           if (copyright) {
             (gltf.scene.userData as { copyright?: string }).copyright = copyright;
           }
-          const wrapper = prepareGltfScene(gltf.scene, node.worldTransform, node.centerEcef);
+          const { wrapper, entries } = prepareGltfScene(gltf.scene, node.worldTransform, node.centerEcef);
           node.group = wrapper;
+          node.entries = entries;
           node.state = 'loaded';
           allLoadedGlbNodes.add(node);
           rootGroup.add(wrapper);
@@ -644,14 +645,16 @@ export function createGoogle3dTilesController(callbacks: Google3dTilesCallbacks 
   const traverseAndSelect = (camera: THREE.PerspectiveCamera, viewportHeightPx: number) => {
     if (!enabled || !rootNode || originLat === null || originLon === null) return;
     frameCounter++;
+    lastTraversalTime = performance.now();
+
+    camera.updateMatrixWorld();
+    projScreenMatrix.multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse);
+    frustum.setFromProjectionMatrix(projScreenMatrix);
 
     const camEcef = localToEcef(camera.position);
-    // Also keep origin ECEF so tiles around the scene center load even if the camera is high up
-    const focusEcef = originEcef;
     const fovRad = (camera.fov || 60) * DEG;
     const sseFactor = Math.max(240, viewportHeightPx) / (2.0 * Math.tan(fovRad * 0.5));
 
-    // Hide all loaded GLB groups first; the active cut of the tree will set .visible = true
     for (const n of allLoadedGlbNodes) {
       if (n.group) n.group.visible = false;
     }
@@ -661,31 +664,32 @@ export function createGoogle3dTilesController(callbacks: Google3dTilesCallbacks 
     const visit = (node: TileNode): boolean => {
       node.lastVisitedFrame = frameCounter;
 
-      // Distance from camera and from scene origin to tile bounding sphere surface
       const distCamCenter = Math.hypot(
         node.centerEcef[0] - camEcef[0],
         node.centerEcef[1] - camEcef[1],
         node.centerEcef[2] - camEcef[2],
       );
-      const distOriginCenter = Math.hypot(
-        node.centerEcef[0] - focusEcef[0],
-        node.centerEcef[1] - focusEcef[1],
-        node.centerEcef[2] - focusEcef[2],
-      );
-
       const distCamSurface = Math.max(0.0, distCamCenter - node.radiusM);
-      const distOriginSurface = Math.max(0.0, distOriginCenter - node.radiusM);
 
-      // Cull branches completely outside maxRangeM of both camera and origin
-      if (Math.min(distCamSurface, distOriginSurface) > maxRangeM) {
+      // Distance culling around the camera only
+      if (distCamSurface > maxRangeM) {
         return false;
       }
 
-      const d = Math.max(1.0, Math.min(distCamSurface, distOriginSurface + 250));
+      // Frustum culling: for tiles not enveloping the camera (radius < 3000m and dist > 200m),
+      // check if their bounding sphere intersects the camera frustum.
+      if (node.radiusM < 3000 && distCamSurface > 200) {
+        ecefToLocalPoint(node.centerEcef, tmpSphere.center);
+        tmpSphere.radius = node.radiusM * 1.15;
+        if (!frustum.intersectsSphere(tmpSphere)) {
+          return false;
+        }
+      }
+
+      const d = Math.max(1.0, distCamSurface);
       const sse = (node.geometricError * sseFactor) / d;
       const shouldRefine = sse > maxSSE;
 
-      // External JSON tileset node: must fetch JSON to discover children
       if (node.contentKind === 'json') {
         if (node.state === 'unloaded') {
           loadQueue.push({ node, priority: sse });
@@ -701,9 +705,8 @@ export function createGoogle3dTilesController(callbacks: Google3dTilesCallbacks 
         return anyRendered;
       }
 
-      // Coarse planetary/regional tiles (geometricError > 250): skip downloading their huge
-      // low-res GLBs when refining and jump straight into their children.
-      const isCoarseAncestor = node.geometricError > 250 && node.children.length > 0;
+      // Skip downloading planetary/city-wide low-res GLB blobs when refining deeper
+      const isCoarseAncestor = node.geometricError > 140 && node.children.length > 0;
       if (!isCoarseAncestor && node.contentKind === 'glb' && node.state === 'unloaded') {
         loadQueue.push({ node, priority: sse });
       }
@@ -713,7 +716,6 @@ export function createGoogle3dTilesController(callbacks: Google3dTilesCallbacks 
         let anyChildRendered = false;
 
         for (const child of node.children) {
-          // Check if child intersects our interest range
           const cDistCam = Math.max(
             0,
             Math.hypot(
@@ -722,15 +724,13 @@ export function createGoogle3dTilesController(callbacks: Google3dTilesCallbacks 
               child.centerEcef[2] - camEcef[2],
             ) - child.radiusM,
           );
-          const cDistOrig = Math.max(
-            0,
-            Math.hypot(
-              child.centerEcef[0] - focusEcef[0],
-              child.centerEcef[1] - focusEcef[1],
-              child.centerEcef[2] - focusEcef[2],
-            ) - child.radiusM,
-          );
-          if (Math.min(cDistCam, cDistOrig) > maxRangeM) continue;
+          if (cDistCam > maxRangeM) continue;
+
+          if (child.radiusM < 3000 && cDistCam > 200) {
+            ecefToLocalPoint(child.centerEcef, tmpSphere.center);
+            tmpSphere.radius = child.radiusM * 1.15;
+            if (!frustum.intersectsSphere(tmpSphere)) continue;
+          }
 
           const childRendered = visit(child);
           if (childRendered) {
@@ -745,7 +745,6 @@ export function createGoogle3dTilesController(callbacks: Google3dTilesCallbacks 
         }
       }
 
-      // Fallback or leaf: show this node's own GLB mesh if loaded
       if (node.group) {
         node.group.visible = true;
         return true;
@@ -755,21 +754,23 @@ export function createGoogle3dTilesController(callbacks: Google3dTilesCallbacks 
 
     visit(rootNode);
 
-    // Dispatch highest-SSE (most urgent) loads first
     if (loadQueue.length > 0 && activeRequests < maxConcurrent) {
       loadQueue.sort((a, b) => b.priority - a.priority);
+      // Dispatch at most 3 new requests per traversal tick so GLB parsing spreads across frames
+      let dispatched = 0;
       for (const item of loadQueue) {
-        if (activeRequests >= maxConcurrent) break;
+        if (activeRequests >= maxConcurrent || dispatched >= 3) break;
         loadNodeContent(item.node, generation);
+        dispatched++;
       }
     }
 
-    // Evict distant tiles when cache exceeds 180 GLB tiles to bound GPU memory
-    if (allLoadedGlbNodes.size > 180) {
+    // Tighter GPU cache eviction (max 95 GLB tiles in memory)
+    if (allLoadedGlbNodes.size > 95) {
       const stale = Array.from(allLoadedGlbNodes)
-        .filter((n) => n.lastVisitedFrame < frameCounter - 30 && (!n.group || !n.group.visible))
+        .filter((n) => n.lastVisitedFrame < frameCounter - 20 && (!n.group || !n.group.visible))
         .sort((a, b) => a.lastVisitedFrame - b.lastVisitedFrame);
-      const toDrop = Math.min(stale.length, allLoadedGlbNodes.size - 140);
+      const toDrop = Math.min(stale.length, allLoadedGlbNodes.size - 70);
       for (let i = 0; i < toDrop; i++) {
         const victim = stale[i]!;
         if (victim.group) {
@@ -777,11 +778,13 @@ export function createGoogle3dTilesController(callbacks: Google3dTilesCallbacks 
           disposeObject3D(victim.group);
           victim.group = null;
         }
+        victim.entries = [];
         victim.state = 'unloaded';
         allLoadedGlbNodes.delete(victim);
         loadedGlbCount = Math.max(0, loadedGlbCount - 1);
       }
     }
+    callbacks.onDirty?.();
   };
 
   const clearAllTiles = () => {
@@ -796,6 +799,7 @@ export function createGoogle3dTilesController(callbacks: Google3dTilesCallbacks 
         disposeObject3D(n.group);
         n.group = null;
       }
+      n.entries = [];
     }
     allLoadedGlbNodes.clear();
     rootNode = null;
@@ -871,14 +875,18 @@ export function createGoogle3dTilesController(callbacks: Google3dTilesCallbacks 
       ensureRootLoaded();
       if (!rootNode) return;
 
+      const now = performance.now();
+      // Throttle LOD tree traversal to at most ~10 Hz (every 100 ms) during continuous flight
+      if (now - lastTraversalTime < 100) return;
+
       const movedDistSq = camera.position.distanceToSquared(lastCamUpdatePos);
       const rotDelta =
         Math.abs(camera.rotation.x - lastCamUpdateRot.x) +
         Math.abs(camera.rotation.y - lastCamUpdateRot.y) +
         Math.abs(camera.rotation.z - lastCamUpdateRot.z);
 
-      // Re-evaluate LOD when the camera moves > 8 m or rotates > ~3 degrees
-      if (movedDistSq > 64 || rotDelta > 0.05) {
+      // Re-evaluate LOD when the camera moves > 15 m or rotates > ~4 degrees
+      if (movedDistSq > 225 || rotDelta > 0.07) {
         lastCamUpdatePos.copy(camera.position);
         lastCamUpdateRot.copy(camera.rotation);
         traverseAndSelect(camera, viewportHeightPx);

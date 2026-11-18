@@ -238,7 +238,7 @@ export function SyntheticVisionView({ vehicle, isPrimary, osd, onActivate, strea
     dirtyRef.current = true;
   }, [roofImagery, facades]);
   useEffect(() => {
-    const maxSSE = quality === 'high' ? 10 : quality === 'low' ? 26 : 16;
+    const maxSSE = quality === 'high' ? 18 : quality === 'low' ? 48 : 28;
     sceneRef.current?.setGoogle3dTiles({
       enabled: google3dTiles,
       apiKey: googleMapsApiKey,
@@ -250,6 +250,9 @@ export function SyntheticVisionView({ vehicle, isPrimary, osd, onActivate, strea
       },
       onAttributionChange: (attr) => {
         if (attr) setG3dAttribution(`Google · ${attr}`);
+      },
+      onDirty: () => {
+        dirtyRef.current = true;
       },
     });
     dirtyRef.current = true;
@@ -509,7 +512,7 @@ export function SyntheticVisionView({ vehicle, isPrimary, osd, onActivate, strea
     scene.setGoogle3dTiles({
       enabled: cam.google3dTiles,
       apiKey: cam.googleMapsApiKey,
-      maxScreenSpaceError: cam.svtQuality === 'high' ? 10 : cam.svtQuality === 'low' ? 26 : 16,
+      maxScreenSpaceError: cam.svtQuality === 'high' ? 18 : cam.svtQuality === 'low' ? 48 : 28,
       onStatusChange: (st, msg) => {
         setG3dStatus(st);
         setG3dErrorMsg(msg);
@@ -517,6 +520,9 @@ export function SyntheticVisionView({ vehicle, isPrimary, osd, onActivate, strea
       },
       onAttributionChange: (attr) => {
         if (attr) setG3dAttribution(`Google · ${attr}`);
+      },
+      onDirty: () => {
+        dirtyRef.current = true;
       },
     });
     setSvtFov(scene.getFov());
@@ -844,7 +850,7 @@ export function SyntheticVisionView({ vehicle, isPrimary, osd, onActivate, strea
     const scene = sceneRef.current;
     if (!scene) return;
     const grid = drapeGrid;
-    if (buildingsSource === 'off' || !grid || lat == null || lon == null) {
+    if (buildingsSource === 'off' || google3dTiles || !grid || lat == null || lon == null) {
       if (buildingsRequestedRef.current !== null) cancelBuildingLoads();
       buildingsRequestedRef.current = null;
       ++buildingsTokenRef.current;
@@ -878,7 +884,7 @@ export function SyntheticVisionView({ vehicle, isPrimary, osd, onActivate, strea
       }
     })();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [buildingsSource, drapeGrid, buildingsLatKey, buildingsLonKey, meshVersion]);
+  }, [buildingsSource, google3dTiles, drapeGrid, buildingsLatKey, buildingsLonKey, meshVersion]);
 
   const overlayAttitude = att ? { roll: att.roll, pitch: att.pitch } : null;
   // The 3D scene already shows a true banked horizon — drop the flat cyan line.

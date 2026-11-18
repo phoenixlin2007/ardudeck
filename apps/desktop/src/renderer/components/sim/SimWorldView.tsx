@@ -745,7 +745,7 @@ export default function SimWorldView() {
   useEffect(() => {
     const origin = geoOriginRef.current ?? flatLatLon();
     const homeElev = origin && simGrid ? sampleElevation(simGrid, origin.lat, origin.lon) : 0;
-    const maxSSE = quality === 'high' ? 10 : quality === 'low' ? 26 : 16;
+    const maxSSE = quality === 'high' ? 18 : quality === 'low' ? 48 : 28;
     sceneRef.current?.setGoogle3dTiles({
       enabled: google3dTiles,
       apiKey: googleMapsApiKey,
