@@ -12,6 +12,7 @@ import { SvtImageryPicker, Google3dTilesSettingsSection } from '../camera/svt/Sv
 import { useTranslation } from 'react-i18next';
 import { useSimStateStore, type SimStateMessage } from '../../stores/sim-state-store';
 import { useTelemetryStore } from '../../stores/telemetry-store';
+import { useSmoothTelemetry } from '../../perf/render-governor';
 import { createSimWorldScene, type SimWorldScene, type SimCameraMode, type SimVehicleFrame, type SimObstacle, type SimWaypoint } from './sim-world-scene';
 import { FlightControlPanel } from '../panels/FlightControlPanel';
 import ObstaclePanel from './ObstaclePanel';
@@ -46,8 +47,16 @@ import {
   loadElevationGrid,
   buildTerrainGeometry,
   sampleElevation,
+  M_PER_DEG_LAT,
+  metersPerDegLon,
   type ElevationGrid,
 } from '../camera/svt/svt-terrain';
+import {
+  eulerRatesFromBody,
+  lerpAngle,
+  predictAngle,
+  predictPosition,
+} from '../camera/svt/svt-pose-buffer';
 import {
   WIDE_RING_SPANS_M,
   loadDrapeRings,
@@ -253,6 +262,9 @@ export default function SimWorldView() {
   // so the 3D world picks the right per-airframe model.
   const qEnableRef = useRef<number | undefined>(undefined);
 
+  // Keep telemetry store flushes unthrottled while the 3D world is open.
+  useSmoothTelemetry();
+
   const [cameraMode, setCameraMode] = useState<SimCameraMode>('orbit');
   const [showTerrain, setShowTerrain] = useState(false);
   const satellite = useCameraStore((s) => s.svtSatellite);
@@ -372,7 +384,36 @@ export default function SimWorldView() {
     ro.observe(container);
 
     let lastHud = 0;
+    let lastLoopNow = 0;
+    const simSmooth = new Map<
+      string,
+      {
+        lastUpdateWall: number;
+        sampleTime: number;
+        rawLat: number;
+        rawLon: number;
+        rawAlt: number;
+        vN: number;
+        vE: number;
+        vD: number;
+        rawRoll: number;
+        rawPitch: number;
+        rawYaw: number;
+        rollRate: number;
+        pitchRate: number;
+        yawRate: number;
+        shownLat: number;
+        shownLon: number;
+        shownAlt: number;
+        shownRoll: number;
+        shownPitch: number;
+        shownYaw: number;
+      }
+    >();
     const loop = () => {
+      const now = performance.now();
+      const frameDt = lastLoopNow ? Math.min(0.1, (now - lastLoopNow) / 1000) : 0;
+      lastLoopNow = now;
       const engine = useSimStateStore.getState().vehicles;
       let frames: SimVehicleFrame[];
       let primary: SimStateMessage | null;
@@ -461,24 +502,109 @@ export default function SimWorldView() {
         if (o) {
           const d2r = Math.PI / 180;
           const cosLat = Math.cos((o.lat * Math.PI) / 180);
+          const posAlpha = frameDt > 0 ? 1 - Math.exp(-frameDt / 0.12) : 1;
+          const attAlpha = frameDt > 0 ? 1 - Math.exp(-frameDt / 0.04) : 1;
+          const seenKeys = new Set<string>();
           for (const v of known) {
             const t = byVehicle[v.key];
             if (!t) continue;
             const ll = vehicleLatLon(t);
             if (!ll) continue;
-            const north = (ll.lat - o.lat) * 111320;
-            const east = (ll.lon - o.lon) * 111320 * cosLat;
+            seenKeys.add(v.key);
             const relAlt = t.position?.relativeAlt ?? 0;
-            const att = t.attitude ?? { roll: 0, pitch: 0, yaw: 0 };
+            const vN = t.position?.vx ?? 0;
+            const vE = t.position?.vy ?? 0;
+            const vD = t.position?.vz ?? 0;
+            const att = t.attitude ?? { roll: 0, pitch: 0, yaw: 0, rollSpeed: 0, pitchSpeed: 0, yawSpeed: 0 };
+            const rawYaw = att.yaw !== 0 ? ((att.yaw % 360) + 360) % 360 : (t.vfrHud?.heading ?? 0);
+
+            let sm = simSmooth.get(v.key);
+            if (!sm) {
+              sm = {
+                lastUpdateWall: t.lastUpdate,
+                sampleTime: now,
+                rawLat: ll.lat,
+                rawLon: ll.lon,
+                rawAlt: relAlt,
+                vN,
+                vE,
+                vD,
+                rawRoll: att.roll,
+                rawPitch: att.pitch,
+                rawYaw,
+                rollRate: att.rollSpeed ?? 0,
+                pitchRate: att.pitchSpeed ?? 0,
+                yawRate: att.yawSpeed ?? 0,
+                shownLat: ll.lat,
+                shownLon: ll.lon,
+                shownAlt: relAlt,
+                shownRoll: att.roll,
+                shownPitch: att.pitch,
+                shownYaw: rawYaw,
+              };
+              simSmooth.set(v.key, sm);
+            } else if (t.lastUpdate !== sm.lastUpdateWall) {
+              sm.lastUpdateWall = t.lastUpdate;
+              sm.sampleTime = now;
+              sm.rawLat = ll.lat;
+              sm.rawLon = ll.lon;
+              sm.rawAlt = relAlt;
+              sm.vN = vN;
+              sm.vE = vE;
+              sm.vD = vD;
+              sm.rawRoll = att.roll;
+              sm.rawPitch = att.pitch;
+              sm.rawYaw = rawYaw;
+              sm.rollRate = att.rollSpeed ?? 0;
+              sm.pitchRate = att.pitchSpeed ?? 0;
+              sm.yawRate = att.yawSpeed ?? 0;
+            }
+
+            // 60 FPS dead-reckoning + exponential smoothing so 4–10 Hz MAVLink never stutters
+            const dt = Math.min(0.4, Math.max(0, (now - sm.sampleTime) / 1000));
+            const pred = predictPosition(
+              { lat: sm.rawLat, lon: sm.rawLon, altMsl: sm.rawAlt, agl: sm.rawAlt, vN: sm.vN, vE: sm.vE, vD: sm.vD },
+              dt,
+              M_PER_DEG_LAT,
+              metersPerDegLon(sm.rawLat),
+            );
+            const jumpM = Math.hypot(
+              (pred.lat - sm.shownLat) * M_PER_DEG_LAT,
+              (pred.lon - sm.shownLon) * metersPerDegLon(sm.rawLat),
+            );
+            if (jumpM > 250) {
+              sm.shownLat = pred.lat;
+              sm.shownLon = pred.lon;
+              sm.shownAlt = pred.agl;
+            } else {
+              sm.shownLat += (pred.lat - sm.shownLat) * posAlpha;
+              sm.shownLon += (pred.lon - sm.shownLon) * posAlpha;
+              sm.shownAlt += (pred.agl - sm.shownAlt) * posAlpha;
+            }
+
+            const eRates = eulerRatesFromBody(sm.rawRoll, sm.rawPitch, {
+              p: sm.rollRate,
+              q: sm.pitchRate,
+              r: sm.yawRate,
+            });
+            const predRoll = predictAngle(sm.rawRoll, eRates.rollRate, dt);
+            const predPitch = predictAngle(sm.rawPitch, eRates.pitchRate, dt);
+            const predYaw = predictAngle(sm.rawYaw, eRates.yawRate, dt);
+            sm.shownRoll = lerpAngle(sm.shownRoll, predRoll, attAlpha);
+            sm.shownPitch = lerpAngle(sm.shownPitch, predPitch, attAlpha);
+            sm.shownYaw = lerpAngle(sm.shownYaw, predYaw, attAlpha);
+
+            const north = (sm.shownLat - o.lat) * 111320;
+            const east = (sm.shownLon - o.lon) * 111320 * cosLat;
             const state: SimStateMessage = {
               type: 'state',
               id: v.key,
               home: { lat: o.lat, lng: o.lon, alt: 0, heading: 0 },
               timestamp: 0,
-              position: [north, east, -relAlt],
-              velocity: [t.position?.vx ?? 0, t.position?.vy ?? 0, t.position?.vz ?? 0],
+              position: [north, east, -sm.shownAlt],
+              velocity: [sm.vN, sm.vE, sm.vD],
               quaternion: [1, 0, 0, 0],
-              euler: { roll: att.roll * d2r, pitch: att.pitch * d2r, yaw: att.yaw * d2r },
+              euler: { roll: sm.shownRoll * d2r, pitch: sm.shownPitch * d2r, yaw: sm.shownYaw * d2r },
               batteryVoltage: t.battery && t.battery.voltage > 0 ? t.battery.voltage : undefined,
             };
             const isActive = v.key === activeKey;
@@ -497,6 +623,9 @@ export default function SimWorldView() {
             });
             if (isActive) activePrimary = state;
             if (!firstPrimary) firstPrimary = state;
+          }
+          for (const k of simSmooth.keys()) {
+            if (!seenKeys.has(k)) simSmooth.delete(k);
           }
         }
         primary = activePrimary ?? firstPrimary;
@@ -602,7 +731,6 @@ export default function SimWorldView() {
       }
 
       // Throttled HUD sample from the primary vehicle.
-      const now = performance.now();
       if (now - lastHud > 100) {
         lastHud = now;
         setHud(primary);
@@ -742,6 +870,7 @@ export default function SimWorldView() {
   useEffect(() => {
     sceneRef.current?.setMeshes(meshesFor('svt'), geoOriginRef.current, simGrid);
   }, [meshVersion, fixSignal, originRev, simGrid]);
+  const hasGeoOrigin = fixSignal.length > 0;
   useEffect(() => {
     const origin = geoOriginRef.current ?? flatLatLon();
     const homeElev = origin && simGrid ? sampleElevation(simGrid, origin.lat, origin.lon) : 0;
@@ -757,7 +886,7 @@ export default function SimWorldView() {
         setG3dErrorMsg(msg);
       },
     });
-  }, [google3dTiles, googleMapsApiKey, quality, fixSignal, originRev, simGrid]);
+  }, [google3dTiles, googleMapsApiKey, quality, hasGeoOrigin, originRev, simGrid]);
 
   // Satellite drape over the sim terrain: same rings the synthetic-vision view
   // builds, centred on the sim's own origin (the world is local metres about
@@ -765,7 +894,7 @@ export default function SimWorldView() {
   useEffect(() => {
     const scene = sceneRef.current;
     if (!scene) return;
-    if (!satellite || !showTerrain || !simGrid) {
+    if (!satellite || !showTerrain || !simGrid || google3dTiles) {
       scene.setDrape(null);
       return;
     }
@@ -795,7 +924,7 @@ export default function SimWorldView() {
       }
     })();
     return () => { cancelled = true; };
-  }, [satellite, imagery, quality, simGrid, showTerrain, drapeCenter, cameraMode]);
+  }, [satellite, imagery, quality, simGrid, showTerrain, drapeCenter, cameraMode, google3dTiles]);
 
   // The revert note is transient: clear it after a few seconds.
   useEffect(() => {
@@ -934,8 +1063,8 @@ export default function SimWorldView() {
         <SimFighterHud hud={hud} />
       )}
 
-      {/* Top-right controls: synthetic-vision terrain toggle + camera mode */}
-      <div className="absolute top-3 right-3 z-10 flex items-center gap-2">
+      {/* Top-right controls: synthetic-vision terrain toggle + Google 3D + camera mode */}
+      <div className="absolute top-3 right-3 z-30 flex max-w-[75%] flex-wrap items-center justify-end gap-1.5">
         <button
           onClick={() => setShowTerrain((v) => !v)}
           disabled={terrainPending}
@@ -1423,7 +1552,7 @@ function FleetOpsPanel() {
   if (vehicles.length < 2) return null;
 
   return (
-    <div className="absolute top-3 left-1/2 -translate-x-1/2 z-20 w-64 bg-surface-overlay backdrop-blur-sm border border-subtle rounded-xl shadow-xl text-content overflow-hidden">
+    <div className="absolute top-14 left-3 z-20 w-64 bg-surface-overlay backdrop-blur-sm border border-subtle rounded-xl shadow-xl text-content overflow-hidden">
       <button
         onClick={() => setCollapsed((c) => !c)}
         className="w-full flex items-center justify-between px-3 py-2 text-[11px] font-semibold uppercase tracking-wide text-content-secondary hover:text-content transition-colors"

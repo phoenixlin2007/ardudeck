@@ -1375,6 +1375,7 @@ export function createSimWorldScene(canvas: HTMLCanvasElement): SimWorldScene {
     setGoogle3dTiles(opts) {
       g3dStatusCb = opts.onStatusChange;
       g3dAttrCb = opts.onAttributionChange;
+      renderer.setPixelRatio(Math.min(window.devicePixelRatio, opts.enabled ? 1.25 : 2));
       if (opts.origin && (opts.origin.lat !== 0 || opts.origin.lon !== 0)) {
         const homeElev = opts.homeElevMsl ?? -terrainBaseYOffset;
         google3d.setOrigin(opts.origin.lat, opts.origin.lon, -homeElev);
@@ -1564,7 +1565,6 @@ export function createSimWorldScene(canvas: HTMLCanvasElement): SimWorldScene {
       }
       updateCamera();
       google3d.updateForCamera(camera, simViewportHeight);
-      syncSimGroundWith3dTiles();
       // Labels: scale with camera distance (approx constant screen size, so they
       // neither stack into an unreadable pile up close nor shrink to dots far
       // out), plus a small per-vehicle stagger separating co-located labels.
