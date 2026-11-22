@@ -147,7 +147,9 @@ function predictPos(sample: Sample<PosSample>, now: number): PosSample {
   const dt = (now - sample.t) / 1000;
   return {
     ...sample.v,
-    ...predictPosition(sample.v, dt, M_PER_DEG_LAT, metersPerDegLon(sample.v.lat)),
+    // Cap dead-reckoning at 0.3s so a brief GC / 3D-Tiles stall never overshoots
+    // 1-2s forward and snaps backwards when the next telemetry fix arrives.
+    ...predictPosition(sample.v, dt, M_PER_DEG_LAT, metersPerDegLon(sample.v.lat), 0.3),
   };
 }
 
@@ -644,14 +646,27 @@ export function SyntheticVisionView({ vehicle, isPrimary, osd, onActivate, strea
             peerSmoothRef.current.set(v.key, st);
           } else if (tel.lastUpdate !== st.lastUpdateWall) {
             st.lastUpdateWall = tel.lastUpdate;
-            st.posSample = { t: now, v: rawPos };
-            st.attSample = { t: now, v: rawAtt };
+            // Only reset position dead-reckoning clock when position actually changed
+            if (
+              rawPos.lat !== st.posSample.v.lat ||
+              rawPos.lon !== st.posSample.v.lon ||
+              rawPos.agl !== st.posSample.v.agl
+            ) {
+              st.posSample = { t: now, v: rawPos };
+            }
+            if (
+              rawAtt.rollDeg !== st.attSample.v.rollDeg ||
+              rawAtt.pitchDeg !== st.attSample.v.pitchDeg ||
+              rawAtt.headingDeg !== st.attSample.v.headingDeg
+            ) {
+              st.attSample = { t: now, v: rawAtt };
+            }
           }
 
-          const dtPos = Math.min(0.5, Math.max(0, (now - st.posSample.t) / 1000));
+          const dtPos = Math.min(0.3, Math.max(0, (now - st.posSample.t) / 1000));
           const predPos: PosSample = {
             ...st.posSample.v,
-            ...predictPosition(st.posSample.v, dtPos, M_PER_DEG_LAT, metersPerDegLon(st.posSample.v.lat)),
+            ...predictPosition(st.posSample.v, dtPos, M_PER_DEG_LAT, metersPerDegLon(st.posSample.v.lat), 0.3),
           };
           st.shownPos = approxDistanceM(st.shownPos.lat, st.shownPos.lon, predPos.lat, predPos.lon) <= SNAP_DIST_M
             ? blendPos(st.shownPos, predPos, 1 - Math.exp(-frameDt / POS_BLEND_TAU_S))

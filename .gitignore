@@ -131,3 +131,7 @@ target/
 # Python bytecode
 __pycache__/
 *.pyc
+
+# Vision navigation experiment datasets & outputs
+scripts/vision_nav/dataset_auto/
+scripts/vision_nav/runs/

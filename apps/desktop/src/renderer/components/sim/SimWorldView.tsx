@@ -389,7 +389,8 @@ export default function SimWorldView() {
       string,
       {
         lastUpdateWall: number;
-        sampleTime: number;
+        posSampleTime: number;
+        attSampleTime: number;
         rawLat: number;
         rawLon: number;
         rawAlt: number;
@@ -522,7 +523,8 @@ export default function SimWorldView() {
             if (!sm) {
               sm = {
                 lastUpdateWall: t.lastUpdate,
-                sampleTime: now,
+                posSampleTime: now,
+                attSampleTime: now,
                 rawLat: ll.lat,
                 rawLon: ll.lon,
                 rawAlt: relAlt,
@@ -545,28 +547,36 @@ export default function SimWorldView() {
               simSmooth.set(v.key, sm);
             } else if (t.lastUpdate !== sm.lastUpdateWall) {
               sm.lastUpdateWall = t.lastUpdate;
-              sm.sampleTime = now;
-              sm.rawLat = ll.lat;
-              sm.rawLon = ll.lon;
-              sm.rawAlt = relAlt;
-              sm.vN = vN;
-              sm.vE = vE;
-              sm.vD = vD;
-              sm.rawRoll = att.roll;
-              sm.rawPitch = att.pitch;
-              sm.rawYaw = rawYaw;
-              sm.rollRate = att.rollSpeed ?? 0;
-              sm.pitchRate = att.pitchSpeed ?? 0;
-              sm.yawRate = att.yawSpeed ?? 0;
+              // Only reset position dead-reckoning clock when position actually changed
+              if (ll.lat !== sm.rawLat || ll.lon !== sm.rawLon || relAlt !== sm.rawAlt) {
+                sm.posSampleTime = now;
+                sm.rawLat = ll.lat;
+                sm.rawLon = ll.lon;
+                sm.rawAlt = relAlt;
+                sm.vN = vN;
+                sm.vE = vE;
+                sm.vD = vD;
+              }
+              if (att.roll !== sm.rawRoll || att.pitch !== sm.rawPitch || rawYaw !== sm.rawYaw) {
+                sm.attSampleTime = now;
+                sm.rawRoll = att.roll;
+                sm.rawPitch = att.pitch;
+                sm.rawYaw = rawYaw;
+                sm.rollRate = att.rollSpeed ?? 0;
+                sm.pitchRate = att.pitchSpeed ?? 0;
+                sm.yawRate = att.yawSpeed ?? 0;
+              }
             }
 
-            // 60 FPS dead-reckoning + exponential smoothing so 4–10 Hz MAVLink never stutters
-            const dt = Math.min(0.4, Math.max(0, (now - sm.sampleTime) / 1000));
+            // 60 FPS dead-reckoning + exponential smoothing (capped at 0.3s so stalls never snap back)
+            const dtPos = Math.min(0.3, Math.max(0, (now - sm.posSampleTime) / 1000));
+            const dtAtt = Math.min(0.25, Math.max(0, (now - sm.attSampleTime) / 1000));
             const pred = predictPosition(
               { lat: sm.rawLat, lon: sm.rawLon, altMsl: sm.rawAlt, agl: sm.rawAlt, vN: sm.vN, vE: sm.vE, vD: sm.vD },
-              dt,
+              dtPos,
               M_PER_DEG_LAT,
               metersPerDegLon(sm.rawLat),
+              0.3,
             );
             const jumpM = Math.hypot(
               (pred.lat - sm.shownLat) * M_PER_DEG_LAT,
@@ -587,9 +597,9 @@ export default function SimWorldView() {
               q: sm.pitchRate,
               r: sm.yawRate,
             });
-            const predRoll = predictAngle(sm.rawRoll, eRates.rollRate, dt);
-            const predPitch = predictAngle(sm.rawPitch, eRates.pitchRate, dt);
-            const predYaw = predictAngle(sm.rawYaw, eRates.yawRate, dt);
+            const predRoll = predictAngle(sm.rawRoll, eRates.rollRate, dtAtt);
+            const predPitch = predictAngle(sm.rawPitch, eRates.pitchRate, dtAtt);
+            const predYaw = predictAngle(sm.rawYaw, eRates.yawRate, dtAtt);
             sm.shownRoll = lerpAngle(sm.shownRoll, predRoll, attAlpha);
             sm.shownPitch = lerpAngle(sm.shownPitch, predPitch, attAlpha);
             sm.shownYaw = lerpAngle(sm.shownYaw, predYaw, attAlpha);
@@ -793,17 +803,14 @@ export default function SimWorldView() {
     });
   }, [customFramePath, activeVehicle, sitlModel, sitlVehicleType]);
 
-  // Reactive trigger that changes once a position fix exists (and as the vehicle
-  // moves), so the terrain effect can build as soon as the home origin is set.
-  const fixSignal = useTelemetryStore((s) =>
-    s.position.lat !== 0 || s.position.lon !== 0
-      ? `${Math.round(s.position.lat * 1000)},${Math.round(s.position.lon * 1000)}`
-      : '',
-  );
+  // Reactive trigger that flips true once a position fix exists (without
+  // re-firing on every 100 m of flight, which previously cancelled in-flight
+  // terrain DEM fetches while leaving terrainOriginRef latched).
+  const hasGeoOrigin = useTelemetryStore((s) => s.position.lat !== 0 || s.position.lon !== 0);
 
   // Synthetic-vision terrain: build the DEM mesh around the home origin (offset
   // so the home surface sits at y = 0, matching the NED vehicle frame), or clear
-  // it. Rebuilds only when toggled or the origin changes.
+  // it. Rebuilds only when toggled, quality changes, or the origin changes.
   useEffect(() => {
     const scene = sceneRef.current;
     if (!scene) return;
@@ -817,7 +824,7 @@ export default function SimWorldView() {
       }
       return;
     }
-    const origin = geoOriginRef.current;
+    const origin = geoOriginRef.current ?? flatLatLon();
     if (!origin) {
       // Nothing to anchor the DEM to: revert the toggle with a note instead of
       // silently arming it.
@@ -825,10 +832,11 @@ export default function SimWorldView() {
       setTerrainError('sim:worldView.terrainNeedsOrigin');
       return;
     }
-    const key = `${origin.lat.toFixed(4)},${origin.lon.toFixed(4)}`;
+    const key = `${origin.lat.toFixed(4)},${origin.lon.toFixed(4)},${quality}`;
     if (terrainOriginRef.current === key) return;
     terrainOriginRef.current = key;
     let cancelled = false;
+    let done = false;
     setTerrainPending(true);
     setTerrainError(null);
     void (async () => {
@@ -841,6 +849,7 @@ export default function SimWorldView() {
         const homeElev = sampleElevation(grid, origin.lat, origin.lon);
         sceneRef.current?.setTerrain(buildTerrainGeometry(grid), -homeElev);
         setSimGrid(grid);
+        done = true;
       } catch {
         if (!cancelled) {
           terrainOriginRef.current = null; // allow a later retry
@@ -853,8 +862,15 @@ export default function SimWorldView() {
     })();
     return () => {
       cancelled = true;
+      // If we aborted an in-flight load before it completed, clear the latch
+      // so the next effect run can retry cleanly (leaving completed terrain
+      // intact for the !showTerrain branch to dispose).
+      if (!done && terrainOriginRef.current === key) {
+        terrainOriginRef.current = null;
+        setTerrainPending(false);
+      }
     };
-  }, [showTerrain, fixSignal, quality, originRev]);
+  }, [showTerrain, hasGeoOrigin, quality, originRev]);
 
   const meshVersion = useSceneMeshStore((s) => s.version);
   const customGlbEnabled = useSceneMeshStore((s) => s.enabled);
@@ -868,9 +884,8 @@ export default function SimWorldView() {
   const [g3dErrorMsg, setG3dErrorMsg] = useState<string | undefined>(undefined);
   const [draftApiKey, setDraftApiKey] = useState('');
   useEffect(() => {
-    sceneRef.current?.setMeshes(meshesFor('svt'), geoOriginRef.current, simGrid);
-  }, [meshVersion, fixSignal, originRev, simGrid]);
-  const hasGeoOrigin = fixSignal.length > 0;
+    sceneRef.current?.setMeshes(meshesFor('svt'), geoOriginRef.current ?? flatLatLon(), simGrid);
+  }, [meshVersion, hasGeoOrigin, originRev, simGrid]);
   useEffect(() => {
     const origin = geoOriginRef.current ?? flatLatLon();
     const homeElev = origin && simGrid ? sampleElevation(simGrid, origin.lat, origin.lon) : 0;

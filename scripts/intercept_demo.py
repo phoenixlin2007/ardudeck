@@ -522,19 +522,186 @@ def connect_tcp_with_retry(
     raise TimeoutError(f"Timed out waiting for {label} on tcp:127.0.0.1:{port}")
 
 
+def get_lan_ip() -> str:
+    """Detect this host's primary Wi-Fi / LAN IPv4 address for iPad/remote GCS connection."""
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            s.connect(("8.8.8.8", 80))
+            ip = s.getsockname()[0]
+            if ip and not ip.startswith("127."):
+                return ip
+        finally:
+            s.close()
+    except Exception:
+        pass
+    try:
+        ip = socket.gethostbyname(socket.gethostname())
+        if ip and not ip.startswith("127."):
+            return ip
+    except Exception:
+        pass
+    return "127.0.0.1"
+
+
+class MultiGcsBridge:
+    """Forwards MAVLink packets between SITLs and both local Mac ArduDeck + remote iPad GCS.
+
+    Supports:
+      - Local UDP push (127.0.0.1:<gcs_port>) for Mac ArduDeck
+      - Remote TCP server (0.0.0.0:<tcp_port>) so iPad can actively connect without knowing iPad IP
+      - Remote UDP server (0.0.0.0:<udp_port>) so iPad UDP Client auto-registers on first packet
+    """
+
+    def __init__(
+        self,
+        local_udp_port: int = 14550,
+        remote_tcp_port: int = 14560,
+        remote_udp_port: int = 14555,
+        extra_udp: Optional[list[Tuple[str, int]]] = None,
+    ) -> None:
+        self.static_udp_targets: list[Tuple[str, int]] = [("127.0.0.1", local_udp_port)]
+        if extra_udp:
+            self.static_udp_targets.extend(extra_udp)
+
+        # UDP socket bound on 0.0.0.0:<remote_udp_port> so iPad UDP clients can initiate connection
+        self.udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.udp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.udp_sock.bind(("0.0.0.0", remote_udp_port))
+        self.udp_sock.setblocking(False)
+        self.remote_udp_clients: dict[Tuple[str, int], float] = {}
+
+        # TCP listening socket on 0.0.0.0:<remote_tcp_port> so iPad TCP clients can connect directly
+        self.tcp_server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.tcp_server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.tcp_server.bind(("0.0.0.0", remote_tcp_port))
+        self.tcp_server.listen(8)
+        self.tcp_server.setblocking(False)
+        self.tcp_clients: list[Tuple[socket.socket, Tuple[str, int]]] = []
+
+        self.lan_ip = get_lan_ip()
+        self.local_udp_port = local_udp_port
+        self.remote_tcp_port = remote_tcp_port
+        self.remote_udp_port = remote_udp_port
+
+    def broadcast(self, payload: bytes) -> None:
+        now = time.time()
+        for addr in self.static_udp_targets:
+            try:
+                self.udp_sock.sendto(payload, addr)
+            except OSError:
+                pass
+
+        # Dynamic remote UDP clients (expire after 30s of silence)
+        stale_udp = [addr for addr, ts in self.remote_udp_clients.items() if now - ts > 30.0]
+        for addr in stale_udp:
+            del self.remote_udp_clients[addr]
+            print(f"[BRIDGE] 遠端 UDP 裝置已逾時斷線: {addr[0]}:{addr[1]}")
+        for addr in list(self.remote_udp_clients.keys()):
+            try:
+                self.udp_sock.sendto(payload, addr)
+            except OSError:
+                pass
+
+        # Connected remote TCP clients (e.g. iPad ArduDeck)
+        dead_tcp: list[Tuple[socket.socket, Tuple[str, int]]] = []
+        for sock, addr in self.tcp_clients:
+            try:
+                sock.sendall(payload)
+            except BlockingIOError:
+                pass
+            except OSError:
+                dead_tcp.append((sock, addr))
+        for item in dead_tcp:
+            self._drop_tcp(item)
+
+    def poll_incoming(self) -> list[bytes]:
+        """Accept new TCP clients and collect incoming GCS bytes from both UDP & TCP."""
+        incoming: list[bytes] = []
+        now = time.time()
+
+        # 1. Accept any waiting TCP connections from iPad / remote GCS
+        while True:
+            try:
+                client_sock, client_addr = self.tcp_server.accept()
+                client_sock.setblocking(False)
+                client_sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                self.tcp_clients.append((client_sock, client_addr))
+                print(f"[BRIDGE] ✅ 遠端裝置 (TCP) 已連線: {client_addr[0]}:{client_addr[1]}")
+            except BlockingIOError:
+                break
+            except OSError:
+                break
+
+        # 2. Drain UDP incoming (registers remote iPad UDP clients automatically)
+        while True:
+            try:
+                data, addr = self.udp_sock.recvfrom(4096)
+                if addr not in self.static_udp_targets:
+                    if addr not in self.remote_udp_clients:
+                        print(f"[BRIDGE] ✅ 遠端裝置 (UDP) 已連線: {addr[0]}:{addr[1]}")
+                    self.remote_udp_clients[addr] = now
+                if data:
+                    incoming.append(data)
+            except BlockingIOError:
+                break
+            except OSError:
+                break
+
+        # 3. Drain TCP incoming from connected remote GCS clients
+        dead_tcp: list[Tuple[socket.socket, Tuple[str, int]]] = []
+        for sock, addr in list(self.tcp_clients):
+            try:
+                data = sock.recv(4096)
+                if not data:
+                    dead_tcp.append((sock, addr))
+                else:
+                    incoming.append(data)
+            except BlockingIOError:
+                pass
+            except OSError:
+                dead_tcp.append((sock, addr))
+        for item in dead_tcp:
+            self._drop_tcp(item)
+
+        return incoming
+
+    def _drop_tcp(self, item: Tuple[socket.socket, Tuple[str, int]]) -> None:
+        sock, addr = item
+        if item in self.tcp_clients:
+            self.tcp_clients.remove(item)
+            print(f"[BRIDGE] 遠端裝置 (TCP) 已斷線: {addr[0]}:{addr[1]}")
+        try:
+            sock.close()
+        except OSError:
+            pass
+
+    def close(self) -> None:
+        for sock, _ in list(self.tcp_clients):
+            try:
+                sock.close()
+            except OSError:
+                pass
+        self.tcp_clients.clear()
+        for s in (self.tcp_server, self.udp_sock):
+            try:
+                s.close()
+            except OSError:
+                pass
+
+
 def send_gcs_statustext(
-    gcs_sock: socket.socket,
-    gcs_addr: Tuple[str, int],
+    bridge: MultiGcsBridge,
     sysid: int,
     text: str,
     severity: int = mavutil.mavlink.MAV_SEVERITY_ALERT,
 ) -> None:
-    """Encode a MAVLink STATUSTEXT message from `sysid` and send directly to ArduDeck UDP port."""
+    """Encode a MAVLink STATUSTEXT message from `sysid` and broadcast to all connected GCSes."""
     try:
         mav = mavutil.mavlink.MAVLink(None, srcSystem=sysid, srcComponent=1)
         msg = mav.statustext_encode(severity, text.encode("utf-8")[:50])
         pkt = msg.pack(mav)
-        gcs_sock.sendto(bytes(pkt), gcs_addr)
+        bridge.broadcast(bytes(pkt))
     except Exception:
         pass
 
@@ -547,7 +714,11 @@ def main() -> None:
     parser.add_argument("--ardupilot-dir", type=str, default=os.environ.get("ARDUPILOT_DIR"),
                         help="Path to ArduPilot repository root (e.g. ~/ardupilot)")
     parser.add_argument("--gcs-port", type=int, default=14550,
-                        help="UDP port where ArduDeck listens (default: 14550)")
+                        help="Local UDP port where Mac ArduDeck listens (default: 14550)")
+    parser.add_argument("--tcp-port", type=int, default=14560,
+                        help="LAN TCP server port for iPad/remote GCS active connection (default: 14560)")
+    parser.add_argument("--udp-port", type=int, default=14555,
+                        help="LAN UDP server port for iPad/remote GCS UDP Client connection (default: 14555)")
     parser.add_argument("--hit-distance", type=float, default=INTERCEPT_HIT_RADIUS_M,
                         help=f"3D distance threshold (m) for intercept success (default: {INTERCEPT_HIT_RADIUS_M}m)")
     parser.add_argument("--continuous", action="store_true",
@@ -599,11 +770,13 @@ def main() -> None:
         plane_conn = connect_tcp_with_retry(5760, "ArduPlane (SYS 1)")
         copter_conn = connect_tcp_with_retry(5770, "ArduCopter (SYS 2)")
 
-    # Single UDP bridge socket to ArduDeck GCS (127.0.0.1:14550)
-    gcs_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    gcs_sock.setblocking(False)
-    gcs_addr = ("127.0.0.1", args.gcs_port)
-    print(f"[BRIDGE] Forwarding both SYS 1 (Plane) & SYS 2 (Copter) to ArduDeck at udp://{gcs_addr[0]}:{gcs_addr[1]}")
+    # Multi-GCS bridge: local Mac ArduDeck (UDP 14550) + iPad/remote TCP (14560) & UDP (14555)
+    bridge = MultiGcsBridge(
+        local_udp_port=args.gcs_port,
+        remote_tcp_port=args.tcp_port,
+        remote_udp_port=args.udp_port,
+    )
+    print(f"[BRIDGE] Forwarding both SYS 1 (Plane) & SYS 2 (Copter) to local ArduDeck at udp://127.0.0.1:{args.gcs_port}")
 
     # Configure SITL parameters & high-rate telemetry streams
     set_param(plane_conn, 1, "SYSID_THISMAV", 1)
@@ -640,16 +813,18 @@ def main() -> None:
 
     print("\n======================================================================")
     print("  ArduDeck Dual-SITL Interception Running!")
-    print("  1. In ArduDeck, connect via UDP (Port 14550).")
-    print("  2. Select SYS 1 (Plane) in the top Fleet bar.")
-    print("  3. Open Vision -> Synthetic and enable the '3D GLB' button.")
+    print(f"  [本機 Mac ArduDeck] UDP 監聽 Port {args.gcs_port}")
+    print(f"  [iPad 主動連線] 同 Wi-Fi 下任選其一 (免查 iPad IP):")
+    print(f"    • TCP 連線 (推薦) : {bridge.lan_ip}  Port {args.tcp_port}")
+    print(f"    • UDP Client 連線 : {bridge.lan_ip}  Port {args.udp_port}")
+    print("  操作提示: Mac 鎖定 SYS 1 (固定翼視角)，iPad 切換 SYS 2 (多軸視角)")
     print("======================================================================\n")
 
     while True:
         now = time.time()
         boot_ms = int((now - start_wall) * 1000) & 0xFFFFFFFF
 
-        # 1. Drain messages from both SITLs, update states, and forward raw bytes to ArduDeck
+        # 1. Drain messages from both SITLs, update states, and broadcast raw bytes to all GCSes
         for conn, state in ((plane_conn, plane_state), (copter_conn, copter_state)):
             while True:
                 msg = conn.recv_match(blocking=False)
@@ -657,22 +832,13 @@ def main() -> None:
                     break
                 buf = msg.get_msgbuf()
                 if buf:
-                    try:
-                        gcs_sock.sendto(bytes(buf), gcs_addr)
-                    except OSError:
-                        pass
+                    bridge.broadcast(bytes(buf))
                 update_vehicle_state(msg, state)
 
-        # Forward any GCS packets from ArduDeck back to both SITLs
-        while True:
-            try:
-                data, _ = gcs_sock.recvfrom(4096)
-                plane_conn.write(data)
-                copter_conn.write(data)
-            except BlockingIOError:
-                break
-            except OSError:
-                break
+        # Forward any GCS packets from Mac/iPad ArduDeck back to both SITLs
+        for data in bridge.poll_incoming():
+            plane_conn.write(data)
+            copter_conn.write(data)
 
         # 2. Target Multirotor (SYS 2) State Machine: Xinyi Rd <-> Taipei 101 <-> West River
         if copter_state.has_fix:
@@ -789,9 +955,9 @@ def main() -> None:
                         print("=" * 72 + "\n")
                         telem_log.write(f"HIT: {banner}\n")
 
-                        # Send MAVLink STATUSTEXT directly to ArduDeck UDP port so GCS HUD displays it!
-                        send_gcs_statustext(gcs_sock, gcs_addr, 1, banner)
-                        send_gcs_statustext(gcs_sock, gcs_addr, 2, f"SYS 2 INTERCEPTED AT {cpa_min_m:.1f}M - LANDING")
+                        # Send MAVLink STATUSTEXT to all connected GCSes (Mac + iPad) so HUD displays it!
+                        send_gcs_statustext(bridge, 1, banner)
+                        send_gcs_statustext(bridge, 2, f"SYS 2 INTERCEPTED AT {cpa_min_m:.1f}M - LANDING")
 
                         if not args.continuous:
                             copter_stage = "INTERCEPTED"
