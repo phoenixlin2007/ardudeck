@@ -1,4 +1,4 @@
-name: Build ArduDeck (Steam Deck)
+name: Build ArduDeck (Steam Deck / Win / macOS)
 
 on:
   push:
@@ -14,7 +14,12 @@ on:
         default: 'deck-latest'
         type: string
       build_windows:
-        description: '同時建置 Windows .exe（installer + portable）'
+        description: '同時建置 Windows x64 (.exe)'
+        required: false
+        default: true
+        type: boolean
+      build_macos:
+        description: '同時建置 macOS Apple Silicon arm64 (.dmg / .zip)'
         required: false
         default: true
         type: boolean
@@ -224,10 +229,107 @@ jobs:
           path: apps/desktop/release/out-win/*.exe
           if-no-files-found: error
 
+  build-mac-arm64:
+    name: Build macOS arm64 (.dmg / .zip)
+    if: github.event_name == 'push' || inputs.build_macos
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup version
+        run: |
+          VERSION=$(node -p "require('./package.json').version")
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            CANDIDATE="${GITHUB_REF_NAME#v}"
+            if [[ "$CANDIDATE" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.]+)?$ ]]; then
+              VERSION="$CANDIDATE"
+            fi
+          fi
+          echo "VERSION=${VERSION}" >> "$GITHUB_ENV"
+
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'pnpm'
+
+      - name: Install Python setuptools (for node-gyp)
+        run: python3 -m pip install --break-system-packages setuptools || python3 -m pip install setuptools
+
+      - name: Install dependencies and build native modules
+        run: pnpm install --frozen-lockfile
+
+      - name: Sync version to desktop app
+        run: |
+          node -e "
+            const fs = require('fs');
+            for (const file of ['./package.json', './apps/desktop/package.json']) {
+              const pkg = JSON.parse(fs.readFileSync(file, 'utf8'));
+              pkg.version = '${{ env.VERSION }}';
+              fs.writeFileSync(file, JSON.stringify(pkg, null, 2) + '\n');
+            }
+          "
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo (ardudeck-frame)
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            crates/ardudeck-frame/target
+          key: cargo-frame-mac-arm64-${{ hashFiles('crates/ardudeck-frame/Cargo.toml') }}
+          restore-keys: cargo-frame-mac-arm64-
+
+      - name: Stage open-source frame generator
+        working-directory: apps/desktop
+        run: node scripts/stage-frame.mjs
+
+      - name: Fetch mediamtx (MIT, darwin arm64)
+        run: node tools/fetch-mediamtx.mjs darwin arm64
+
+      # 刻意跳過兩個閉源/Draft binary（fetch-engine.mjs 與 fetch-sim-engine.mjs），
+      # 僅建立空目錄以滿足 electron-builder 的 extraResources 路徑設定。
+      - name: Prepare empty placeholders for skipped closed-source binaries
+        run: mkdir -p apps/desktop/engine apps/desktop/sim-engine-bin
+
+      - name: Build workspace packages
+        run: pnpm build
+
+      - name: Package macOS arm64 (unsigned, skip closed-source binaries)
+        working-directory: apps/desktop
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+        run: pnpm exec electron-builder --mac --arm64 --publish never
+
+      - name: Rename macOS arm64 installers to fixed filenames
+        working-directory: apps/desktop/release
+        run: |
+          shopt -s nullglob
+          mkdir -p out-mac
+          for f in *.dmg; do
+            mv "$f" "out-mac/ArduDeck-macOS-arm64.dmg"
+          done
+          for f in *.zip; do
+            mv "$f" "out-mac/ArduDeck-macOS-arm64.zip"
+          done
+          ls -lh out-mac/
+
+      - name: Upload macOS arm64 artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-arm64
+          path: apps/desktop/release/out-mac/*
+          if-no-files-found: error
+
   publish-release:
     name: Publish to fixed Release (deck-latest)
-    needs: [build-linux, build-windows]
-    if: always() && (needs.build-linux.result == 'success' || needs.build-windows.result == 'success')
+    needs: [build-linux, build-windows, build-mac-arm64]
+    if: always() && (needs.build-linux.result == 'success' || needs.build-windows.result == 'success' || needs.build-mac-arm64.result == 'success')
     runs-on: ubuntu-latest
     steps:
       - name: Download build artifacts
@@ -250,7 +352,7 @@ jobs:
 
           BUILD_TIME=$(date -u +"%Y-%m-%d %H:%M:%S UTC")
           NOTES=$(cat <<EOF
-          自動建置產物（跳過閉源 \`ardudeck-orchestrator\` 與 \`ardudeck-sim-engine\` binary）。
+          自動建置產物（Linux Steam Deck / Windows x64 / macOS arm64，跳過閉源 \`ardudeck-orchestrator\` 與 \`ardudeck-sim-engine\` binary）。
 
           - **Ref**: \`${GITHUB_REF_NAME}\`
           - **Commit**: \`${GITHUB_SHA::8}\`
@@ -259,6 +361,7 @@ jobs:
             \`\`\`bash
             curl -fL "https://github.com/${GITHUB_REPOSITORY}/releases/download/${RELEASE_TAG}/ArduDeck-SteamDeck-x86_64.AppImage" -o ~/Applications/ArduDeck-SteamDeck-x86_64.AppImage && chmod +x ~/Applications/ArduDeck-SteamDeck-x86_64.AppImage
             \`\`\`
+          - **macOS (Apple Silicon) 首次開啟提示**：未經 Apple 公證簽章，安裝後如遇系統阻擋請執行 \`xattr -cr /Applications/ArduDeck.app\`。
           EOF
           )
 
@@ -270,7 +373,7 @@ jobs:
             gh release create "$RELEASE_TAG" \
               --repo "$GITHUB_REPOSITORY" \
               --target "$GITHUB_SHA" \
-              --title "ArduDeck Steam Deck Latest (${RELEASE_TAG})" \
+              --title "ArduDeck Latest (${RELEASE_TAG})" \
               --notes "$NOTES" \
               --prerelease
           fi
