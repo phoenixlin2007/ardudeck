@@ -1,0 +1,3 @@
+{
+  "install": "sudo apt-get update && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y libudev-dev libusb-1.0-0-dev && mkdir -p \"$HOME/.local/bin\" && corepack enable --install-directory \"$HOME/.local/bin\" pnpm && corepack prepare pnpm@9.15.1 --activate && (sed -i '/case \\$- in/,/esac/d' \"$HOME/.bashrc\" 2>/dev/null || true) && (grep -qxF 'export PATH=\"$HOME/.local/bin:$PATH\"' \"$HOME/.bashrc\" || echo 'export PATH=\"$HOME/.local/bin:$PATH\"' >> \"$HOME/.bashrc\") && export PATH=\"$HOME/.local/bin:$PATH\" && rustup target add wasm32-unknown-unknown && pnpm install --frozen-lockfile"
+}
