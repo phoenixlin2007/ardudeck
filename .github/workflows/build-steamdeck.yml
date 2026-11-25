@@ -81,32 +81,40 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Cache Cargo (ardudeck-frame)
+      - name: Cache Cargo (ardudeck-frame & ardudeck-sim-engine)
         uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             crates/ardudeck-frame/target
-          key: cargo-frame-linux-${{ hashFiles('crates/ardudeck-frame/Cargo.toml') }}
-          restore-keys: cargo-frame-linux-
+            crates/ardudeck-sim-engine/target
+          key: cargo-linux-${{ hashFiles('crates/ardudeck-frame/Cargo.toml', 'crates/ardudeck-sim-engine/Cargo.toml') }}
+          restore-keys: cargo-linux-
 
       - name: Stage open-source frame generator
         working-directory: apps/desktop
         run: node scripts/stage-frame.mjs
 
+      - name: Build and stage open-source sim-engine (linux x64)
+        run: |
+          cargo build --release --manifest-path crates/ardudeck-sim-engine/Cargo.toml
+          mkdir -p apps/desktop/sim-engine-bin
+          cp crates/ardudeck-sim-engine/target/release/ardudeck-sim-engine apps/desktop/sim-engine-bin/ardudeck-sim-engine
+          chmod +x apps/desktop/sim-engine-bin/ardudeck-sim-engine
+
       - name: Fetch mediamtx (MIT, linux x64)
         run: node tools/fetch-mediamtx.mjs linux x64
 
-      # 刻意跳過兩個閉源/Draft binary（fetch-engine.mjs 與 fetch-sim-engine.mjs），
-      # 僅建立空目錄以滿足 electron-builder 的 extraResources 路徑設定。
-      - name: Prepare empty placeholders for skipped closed-source binaries
-        run: mkdir -p apps/desktop/engine apps/desktop/sim-engine-bin
+      # 僅跳過閉源多機協調引擎（fetch-engine.mjs / ardudeck-orchestrator），
+      # 建立空目錄以滿足 electron-builder 的 extraResources 路徑設定。
+      - name: Prepare empty placeholder for closed-source orchestrator
+        run: mkdir -p apps/desktop/engine
 
       - name: Build workspace packages
         run: pnpm build
 
-      - name: Package Linux x64 AppImage (skip closed-source binaries)
+      - name: Package Linux x64 AppImage (skip closed-source orchestrator)
         working-directory: apps/desktop
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -176,33 +184,41 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Cache Cargo (ardudeck-frame)
+      - name: Cache Cargo (ardudeck-frame & ardudeck-sim-engine)
         uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             crates/ardudeck-frame/target
-          key: cargo-frame-win-${{ hashFiles('crates/ardudeck-frame/Cargo.toml') }}
-          restore-keys: cargo-frame-win-
+            crates/ardudeck-sim-engine/target
+          key: cargo-win-${{ hashFiles('crates/ardudeck-frame/Cargo.toml', 'crates/ardudeck-sim-engine/Cargo.toml') }}
+          restore-keys: cargo-win-
 
       - name: Stage open-source frame generator
         working-directory: apps/desktop
         run: node scripts/stage-frame.mjs
 
+      - name: Build and stage open-source sim-engine (win32 x64)
+        shell: bash
+        run: |
+          cargo build --release --manifest-path crates/ardudeck-sim-engine/Cargo.toml
+          mkdir -p apps/desktop/sim-engine-bin
+          cp crates/ardudeck-sim-engine/target/release/ardudeck-sim-engine.exe apps/desktop/sim-engine-bin/ardudeck-sim-engine.exe
+
       - name: Fetch mediamtx (MIT, win32 x64)
         run: node tools/fetch-mediamtx.mjs win32 x64
 
-      # 刻意跳過兩個閉源/Draft binary（fetch-engine.mjs 與 fetch-sim-engine.mjs），
-      # 僅建立空目錄以滿足 electron-builder 的 extraResources 路徑設定。
-      - name: Prepare empty placeholders for skipped closed-source binaries
+      # 僅跳過閉源多機協調引擎（fetch-engine.mjs / ardudeck-orchestrator），
+      # 建立空目錄以滿足 electron-builder 的 extraResources 路徑設定。
+      - name: Prepare empty placeholder for closed-source orchestrator
         shell: bash
-        run: mkdir -p apps/desktop/engine apps/desktop/sim-engine-bin
+        run: mkdir -p apps/desktop/engine
 
       - name: Build workspace packages
         run: pnpm build
 
-      - name: Package Windows x64 (.exe, skip closed-source binaries)
+      - name: Package Windows x64 (.exe, skip closed-source orchestrator)
         working-directory: apps/desktop
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -274,32 +290,41 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Cache Cargo (ardudeck-frame)
+      - name: Cache Cargo (ardudeck-frame & ardudeck-sim-engine)
         uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             crates/ardudeck-frame/target
-          key: cargo-frame-mac-arm64-${{ hashFiles('crates/ardudeck-frame/Cargo.toml') }}
-          restore-keys: cargo-frame-mac-arm64-
+            crates/ardudeck-sim-engine/target
+          key: cargo-mac-arm64-${{ hashFiles('crates/ardudeck-frame/Cargo.toml', 'crates/ardudeck-sim-engine/Cargo.toml') }}
+          restore-keys: cargo-mac-arm64-
 
       - name: Stage open-source frame generator
         working-directory: apps/desktop
         run: node scripts/stage-frame.mjs
 
+      - name: Build and stage open-source sim-engine (darwin arm64)
+        run: |
+          cargo build --release --manifest-path crates/ardudeck-sim-engine/Cargo.toml
+          mkdir -p apps/desktop/sim-engine-bin
+          cp crates/ardudeck-sim-engine/target/release/ardudeck-sim-engine apps/desktop/sim-engine-bin/ardudeck-sim-engine
+          chmod +x apps/desktop/sim-engine-bin/ardudeck-sim-engine
+          codesign --force --sign - apps/desktop/sim-engine-bin/ardudeck-sim-engine
+
       - name: Fetch mediamtx (MIT, darwin arm64)
         run: node tools/fetch-mediamtx.mjs darwin arm64
 
-      # 刻意跳過兩個閉源/Draft binary（fetch-engine.mjs 與 fetch-sim-engine.mjs），
-      # 僅建立空目錄以滿足 electron-builder 的 extraResources 路徑設定。
-      - name: Prepare empty placeholders for skipped closed-source binaries
-        run: mkdir -p apps/desktop/engine apps/desktop/sim-engine-bin
+      # 僅跳過閉源多機協調引擎（fetch-engine.mjs / ardudeck-orchestrator），
+      # 建立空目錄以滿足 electron-builder 的 extraResources 路徑設定。
+      - name: Prepare empty placeholder for closed-source orchestrator
+        run: mkdir -p apps/desktop/engine
 
       - name: Build workspace packages
         run: pnpm build
 
-      - name: Package macOS arm64 (unsigned, skip closed-source binaries)
+      - name: Package macOS arm64 (unsigned, skip closed-source orchestrator)
         working-directory: apps/desktop
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -352,7 +377,7 @@ jobs:
 
           BUILD_TIME=$(date -u +"%Y-%m-%d %H:%M:%S UTC")
           NOTES=$(cat <<EOF
-          自動建置產物（Linux Steam Deck / Windows x64 / macOS arm64，跳過閉源 \`ardudeck-orchestrator\` 與 \`ardudeck-sim-engine\` binary）。
+          自動建置產物（Linux Steam Deck / Windows x64 / macOS arm64，已內建開源 \`ardudeck-sim-engine\` 與 \`ardudeck-frame\`，僅跳過閉源 \`ardudeck-orchestrator\`）。
 
           - **Ref**: \`${GITHUB_REF_NAME}\`
           - **Commit**: \`${GITHUB_SHA::8}\`
