@@ -123,6 +123,8 @@
     "axisN": "вісь {{n}}",
     "buttonN": "кнопка {{n}}",
     "buttonPair": "кнопки {{low}}/{{high}}",
+    "djiMode2Preset": "DJI Mode 2",
+    "djiMode2PresetTip": "Застосувати пресет DJI Mode 2 (ROG Ally / Steam Deck): лівий стік = газ/рискання, правий стік = тангаж/крен",
     "channelN": "Кан. {{n}}",
     "channels": "Канали",
     "clearTip": "Скасувати це призначення",

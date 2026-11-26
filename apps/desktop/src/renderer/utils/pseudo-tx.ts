@@ -226,15 +226,46 @@ export function virtualChannels(axes: number[], fns: RcFunctionMap = DEFAULT_RC_
  */
 export function mappingFromRcFunctions(fns: RcFunctionMap = DEFAULT_RC_FUNCTIONS): ChannelMap[] {
   const out = defaultMapping();
-  const assign = (channel: number, axis: number) => {
+  const assign = (channel: number, axis: number, reverse = false) => {
     const i = Math.round(channel) - 1;
     if (i < 0 || i >= RC_CHANNEL_COUNT) return;
-    out[i] = { ...defaultChannelMap(), deadband: 0.02, source: { kind: 'axis', index: axis } };
+    out[i] = { ...defaultChannelMap(), deadband: 0.02, reverse, source: { kind: 'axis', index: axis } };
   };
-  // Gamepad convention: 0 leftX, 1 leftY, 2 rightX, 3 rightY.
+  // Gamepad convention: 0 leftX, 1 leftY (up is -1), 2 rightX, 3 rightY (up is -1).
+  // Throttle must be reversed so pushing the left stick up sends high PWM (2000).
   assign(fns.yaw, 0);
-  assign(fns.throttle, 1);
+  assign(fns.throttle, 1, true);
   assign(fns.roll, 2);
   assign(fns.pitch, 3);
+  return out;
+}
+
+/**
+ * DJI Mode 2 preset for handheld / XInput gamepads (ROG Ally, Steam Deck, Xbox).
+ *
+ * - Left stick up/down  (axis 1, reversed) -> Throttle (up = climb / 2000, centre = hover / 1500)
+ * - Left stick L/R      (axis 0)           -> Yaw      (right = clockwise / 2000)
+ * - Right stick up/down (axis 3)           -> Pitch    (up = -1 -> 1000 PWM = ArduPilot pitch forward)
+ * - Right stick L/R     (axis 2)           -> Roll     (right = roll right / 2000)
+ *
+ * Uses a 6% deadband and gentle 15% expo on Roll/Pitch/Yaw to suit short-throw handheld thumbsticks,
+ * and leaves CH5-16 unassigned so a 4-axis gamepad never drives phantom aux axes.
+ */
+export function djiMode2Mapping(fns: RcFunctionMap = DEFAULT_RC_FUNCTIONS): ChannelMap[] {
+  const out = Array.from({ length: RC_CHANNEL_COUNT }, () => defaultChannelMap());
+  const assign = (channel: number, axis: number, opts: Partial<ChannelMap> = {}) => {
+    const i = Math.round(channel) - 1;
+    if (i < 0 || i >= RC_CHANNEL_COUNT) return;
+    out[i] = {
+      ...defaultChannelMap(),
+      deadband: 0.06,
+      source: { kind: 'axis', index: axis },
+      ...opts,
+    };
+  };
+  assign(fns.yaw, 0, { expo: 0.15 });
+  assign(fns.throttle, 1, { reverse: true, expo: 0 });
+  assign(fns.roll, 2, { expo: 0.15 });
+  assign(fns.pitch, 3, { expo: 0.15 });
   return out;
 }

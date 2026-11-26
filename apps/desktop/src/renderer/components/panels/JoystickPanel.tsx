@@ -151,6 +151,7 @@ export function JoystickPanel(): JSX.Element {
   const enable = usePseudoTxStore((s) => s.enable);
   const disable = usePseudoTxStore((s) => s.disable);
   const resetMapping = usePseudoTxStore((s) => s.resetMapping);
+  const applyDjiMode2Preset = usePseudoTxStore((s) => s.applyDjiMode2Preset);
   const vehicleControl = usePseudoTxStore((s) => s.vehicleControl);
   const vehicleFps = usePseudoTxStore((s) => s.vehicleFps);
   const vehicleSendError = usePseudoTxStore((s) => s.vehicleSendError);
@@ -228,12 +229,21 @@ export function JoystickPanel(): JSX.Element {
           <div className="mb-2 flex items-center justify-between">
             <span className="text-xs font-medium text-content">{t('panels:joystickPanel.channels')}</span>
             {!usingVirtual && (
-              <button
-                onClick={resetMapping}
-                className="flex items-center gap-1 text-[11px] text-content-tertiary hover:text-content"
-              >
-                <RotateCcw className="w-3 h-3" /> {t('common:reset')}
-              </button>
+              <div className="flex items-center gap-2">
+                <button
+                  onClick={applyDjiMode2Preset}
+                  data-tip={t('panels:joystickPanel.djiMode2PresetTip')}
+                  className="rounded bg-blue-500/15 px-2 py-0.5 text-[11px] font-medium text-blue-300 hover:bg-blue-500/25 transition-colors"
+                >
+                  {t('panels:joystickPanel.djiMode2Preset')}
+                </button>
+                <button
+                  onClick={resetMapping}
+                  className="flex items-center gap-1 text-[11px] text-content-tertiary hover:text-content"
+                >
+                  <RotateCcw className="w-3 h-3" /> {t('common:reset')}
+                </button>
+              </div>
             )}
           </div>
           {usingVirtual && (

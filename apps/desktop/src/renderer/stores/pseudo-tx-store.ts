@@ -31,6 +31,7 @@ import {
   looksLikeTransmitter,
   virtualChannels,
   mappingFromRcFunctions,
+  djiMode2Mapping,
   DEFAULT_RC_FUNCTIONS,
   type RcFunctionMap,
 } from '../utils/pseudo-tx';
@@ -196,6 +197,7 @@ interface PseudoTxState {
   setSource: (channel: number, source: ChannelSource) => void;
   updateMap: (channel: number, patch: Partial<ChannelMap>) => void;
   resetMapping: () => void;
+  applyDjiMode2Preset: () => void;
 }
 
 export const usePseudoTxStore = create<PseudoTxState>((set, get) => ({
@@ -436,6 +438,12 @@ export const usePseudoTxStore = create<PseudoTxState>((set, get) => ({
     const mapping = get().connected && !get().isTransmitter
       ? mappingFromRcFunctions(rcFunctionsFromParams())
       : defaultMapping();
+    set({ mapping });
+    writeStoredMapping(mapping);
+  },
+
+  applyDjiMode2Preset: () => {
+    const mapping = djiMode2Mapping(rcFunctionsFromParams());
     set({ mapping });
     writeStoredMapping(mapping);
   },
