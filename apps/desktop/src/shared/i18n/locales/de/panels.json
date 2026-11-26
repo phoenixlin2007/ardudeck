@@ -123,6 +123,8 @@
     "axisN": "Achse {{n}}",
     "buttonN": "Taste {{n}}",
     "buttonPair": "Tasten {{low}}/{{high}}",
+    "djiMode2Preset": "DJI Mode 2",
+    "djiMode2PresetTip": "DJI-Mode-2-Handheld-Profil anwenden (ROG Ally / Steam Deck): Linker Stick = Gas/Gier, Rechter Stick = Nick/Roll",
     "channelN": "K {{n}}",
     "channels": "Kanäle",
     "clearTip": "Diese Zuweisung löschen",

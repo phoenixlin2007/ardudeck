@@ -58,18 +58,29 @@ function MappingPanel(): JSX.Element {
   const setSource = usePseudoTxStore((s) => s.setSource);
   const updateMap = usePseudoTxStore((s) => s.updateMap);
   const resetMapping = usePseudoTxStore((s) => s.resetMapping);
+  const applyDjiMode2Preset = usePseudoTxStore((s) => s.applyDjiMode2Preset);
 
   return (
     <div className="mt-3 pt-3 border-t border-subtle">
       <div className="flex items-center justify-between mb-2">
         <span className="text-xs font-medium text-content">{t('common:channelMapping')}</span>
-        <button
-          type="button"
-          onClick={resetMapping}
-          className="text-xs text-content-secondary hover:text-content transition-colors"
-        >
-          {t('common:reset')}
-        </button>
+        <div className="flex items-center gap-2">
+          <button
+            type="button"
+            onClick={applyDjiMode2Preset}
+            data-tip={t('panels:joystickPanel.djiMode2PresetTip')}
+            className="rounded bg-blue-500/15 px-1.5 py-0.5 text-[11px] font-medium text-blue-300 hover:bg-blue-500/25 transition-colors"
+          >
+            {t('panels:joystickPanel.djiMode2Preset')}
+          </button>
+          <button
+            type="button"
+            onClick={resetMapping}
+            className="text-xs text-content-secondary hover:text-content transition-colors"
+          >
+            {t('common:reset')}
+          </button>
+        </div>
       </div>
 
       <div className="space-y-1.5">

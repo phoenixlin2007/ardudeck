@@ -123,6 +123,8 @@
     "axisN": "轴 {{n}}",
     "buttonN": "按钮 {{n}}",
     "buttonPair": "按钮 {{low}}/{{high}}",
+    "djiMode2Preset": "DJI 美国手",
+    "djiMode2PresetTip": "应用 DJI Mode 2 掌机预设（ROG Ally / Steam Deck）：左摇杆＝油门／偏航，右摇杆＝俯仰／横滚",
     "channelN": "Ch {{n}}",
     "channels": "通道",
     "clearTip": "清除此指派",

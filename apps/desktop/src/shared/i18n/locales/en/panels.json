@@ -123,6 +123,8 @@
     "axisN": "axis {{n}}",
     "buttonN": "button {{n}}",
     "buttonPair": "buttons {{low}}/{{high}}",
+    "djiMode2Preset": "DJI Mode 2",
+    "djiMode2PresetTip": "Apply DJI Mode 2 handheld preset (ROG Ally / Steam Deck): Left stick = Throttle/Yaw, Right stick = Pitch/Roll",
     "channelN": "Ch {{n}}",
     "channels": "Channels",
     "clearTip": "Clear this assignment",

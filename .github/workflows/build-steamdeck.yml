@@ -1,0 +1,410 @@
+name: Build ArduDeck (Steam Deck / Win / macOS)
+
+on:
+  push:
+    tags:
+      - 'v*'
+      - 'deck-*'
+      - '!deck-latest'
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: '固定覆蓋上傳的 Release tag（預設 deck-latest）'
+        required: false
+        default: 'deck-latest'
+        type: string
+      build_windows:
+        description: '同時建置 Windows x64 (.exe)'
+        required: false
+        default: true
+        type: boolean
+      build_macos:
+        description: '同時建置 macOS Apple Silicon arm64 (.dmg / .zip)'
+        required: false
+        default: true
+        type: boolean
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-steamdeck-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  NODE_VERSION: '20'
+
+jobs:
+  build-linux:
+    name: Build Steam Deck AppImage (Linux x64)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup version
+        run: |
+          VERSION=$(node -p "require('./package.json').version")
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            CANDIDATE="${GITHUB_REF_NAME#v}"
+            if [[ "$CANDIDATE" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.]+)?$ ]]; then
+              VERSION="$CANDIDATE"
+            fi
+          fi
+          echo "VERSION=${VERSION}" >> "$GITHUB_ENV"
+
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'pnpm'
+
+      - name: Install Linux native build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libudev-dev libusb-1.0-0-dev
+
+      - name: Install dependencies and build native modules
+        run: pnpm install --frozen-lockfile
+
+      - name: Sync version to desktop app
+        run: |
+          node -e "
+            const fs = require('fs');
+            for (const file of ['./package.json', './apps/desktop/package.json']) {
+              const pkg = JSON.parse(fs.readFileSync(file, 'utf8'));
+              pkg.version = '${{ env.VERSION }}';
+              fs.writeFileSync(file, JSON.stringify(pkg, null, 2) + '\n');
+            }
+          "
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo (ardudeck-frame & ardudeck-sim-engine)
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            crates/ardudeck-frame/target
+            crates/ardudeck-sim-engine/target
+          key: cargo-linux-${{ hashFiles('crates/ardudeck-frame/Cargo.toml', 'crates/ardudeck-sim-engine/Cargo.toml') }}
+          restore-keys: cargo-linux-
+
+      - name: Stage open-source frame generator
+        working-directory: apps/desktop
+        run: node scripts/stage-frame.mjs
+
+      - name: Build and stage open-source sim-engine (linux x64)
+        run: |
+          cargo build --release --manifest-path crates/ardudeck-sim-engine/Cargo.toml
+          mkdir -p apps/desktop/sim-engine-bin
+          cp crates/ardudeck-sim-engine/target/release/ardudeck-sim-engine apps/desktop/sim-engine-bin/ardudeck-sim-engine
+          chmod +x apps/desktop/sim-engine-bin/ardudeck-sim-engine
+
+      - name: Fetch mediamtx (MIT, linux x64)
+        run: node tools/fetch-mediamtx.mjs linux x64
+
+      # 僅跳過閉源多機協調引擎（fetch-engine.mjs / ardudeck-orchestrator），
+      # 建立空目錄以滿足 electron-builder 的 extraResources 路徑設定。
+      - name: Prepare empty placeholder for closed-source orchestrator
+        run: mkdir -p apps/desktop/engine
+
+      - name: Build workspace packages
+        run: pnpm build
+
+      - name: Package Linux x64 AppImage (skip closed-source orchestrator)
+        working-directory: apps/desktop
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: pnpm exec electron-builder --linux AppImage --x64 --publish never
+
+      - name: Rename AppImage to fixed Steam Deck filename
+        working-directory: apps/desktop/release
+        run: |
+          shopt -s nullglob
+          appimages=(*.AppImage)
+          if [ ${#appimages[@]} -ne 1 ]; then
+            echo "Expected 1 AppImage, found ${#appimages[@]}: ${appimages[*]}"
+            exit 1
+          fi
+          mv "${appimages[0]}" "ArduDeck-SteamDeck-x86_64.AppImage"
+          chmod +x "ArduDeck-SteamDeck-x86_64.AppImage"
+          ls -lh "ArduDeck-SteamDeck-x86_64.AppImage"
+
+      - name: Upload Steam Deck AppImage artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: steamdeck-appimage
+          path: apps/desktop/release/ArduDeck-SteamDeck-x86_64.AppImage
+          if-no-files-found: error
+
+  build-windows:
+    name: Build Windows x64 (.exe)
+    if: github.event_name == 'push' || inputs.build_windows
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup version
+        shell: bash
+        run: |
+          VERSION=$(node -p "require('./package.json').version")
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            CANDIDATE="${GITHUB_REF_NAME#v}"
+            if [[ "$CANDIDATE" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.]+)?$ ]]; then
+              VERSION="$CANDIDATE"
+            fi
+          fi
+          echo "VERSION=${VERSION}" >> "$GITHUB_ENV"
+
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'pnpm'
+
+      - name: Install dependencies and build native modules
+        run: pnpm install --frozen-lockfile
+
+      - name: Sync version to desktop app
+        shell: bash
+        run: |
+          node -e "
+            const fs = require('fs');
+            for (const file of ['./package.json', './apps/desktop/package.json']) {
+              const pkg = JSON.parse(fs.readFileSync(file, 'utf8'));
+              pkg.version = '${{ env.VERSION }}';
+              fs.writeFileSync(file, JSON.stringify(pkg, null, 2) + '\n');
+            }
+          "
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo (ardudeck-frame & ardudeck-sim-engine)
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            crates/ardudeck-frame/target
+            crates/ardudeck-sim-engine/target
+          key: cargo-win-${{ hashFiles('crates/ardudeck-frame/Cargo.toml', 'crates/ardudeck-sim-engine/Cargo.toml') }}
+          restore-keys: cargo-win-
+
+      - name: Stage open-source frame generator
+        working-directory: apps/desktop
+        run: node scripts/stage-frame.mjs
+
+      - name: Build and stage open-source sim-engine (win32 x64)
+        shell: bash
+        run: |
+          cargo build --release --manifest-path crates/ardudeck-sim-engine/Cargo.toml
+          mkdir -p apps/desktop/sim-engine-bin
+          cp crates/ardudeck-sim-engine/target/release/ardudeck-sim-engine.exe apps/desktop/sim-engine-bin/ardudeck-sim-engine.exe
+
+      - name: Fetch mediamtx (MIT, win32 x64)
+        run: node tools/fetch-mediamtx.mjs win32 x64
+
+      # 僅跳過閉源多機協調引擎（fetch-engine.mjs / ardudeck-orchestrator），
+      # 建立空目錄以滿足 electron-builder 的 extraResources 路徑設定。
+      - name: Prepare empty placeholder for closed-source orchestrator
+        shell: bash
+        run: mkdir -p apps/desktop/engine
+
+      - name: Build workspace packages
+        run: pnpm build
+
+      - name: Package Windows x64 (.exe, skip closed-source orchestrator)
+        working-directory: apps/desktop
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: pnpm exec electron-builder --win --x64 --publish never
+
+      - name: Rename Windows installers to fixed filenames
+        shell: bash
+        working-directory: apps/desktop/release
+        run: |
+          shopt -s nullglob
+          mkdir -p out-win
+          for f in *-setup.exe; do
+            mv "$f" "out-win/ArduDeck-Windows-x64-setup.exe"
+          done
+          for f in *-portable.exe; do
+            mv "$f" "out-win/ArduDeck-Windows-x64-portable.exe"
+          done
+          ls -lh out-win/
+
+      - name: Upload Windows .exe artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-exe
+          path: apps/desktop/release/out-win/*.exe
+          if-no-files-found: error
+
+  build-mac-arm64:
+    name: Build macOS arm64 (.dmg / .zip)
+    if: github.event_name == 'push' || inputs.build_macos
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup version
+        run: |
+          VERSION=$(node -p "require('./package.json').version")
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            CANDIDATE="${GITHUB_REF_NAME#v}"
+            if [[ "$CANDIDATE" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.]+)?$ ]]; then
+              VERSION="$CANDIDATE"
+            fi
+          fi
+          echo "VERSION=${VERSION}" >> "$GITHUB_ENV"
+
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'pnpm'
+
+      - name: Install Python setuptools (for node-gyp)
+        run: python3 -m pip install --break-system-packages setuptools || python3 -m pip install setuptools
+
+      - name: Install dependencies and build native modules
+        run: pnpm install --frozen-lockfile
+
+      - name: Sync version to desktop app
+        run: |
+          node -e "
+            const fs = require('fs');
+            for (const file of ['./package.json', './apps/desktop/package.json']) {
+              const pkg = JSON.parse(fs.readFileSync(file, 'utf8'));
+              pkg.version = '${{ env.VERSION }}';
+              fs.writeFileSync(file, JSON.stringify(pkg, null, 2) + '\n');
+            }
+          "
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo (ardudeck-frame & ardudeck-sim-engine)
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            crates/ardudeck-frame/target
+            crates/ardudeck-sim-engine/target
+          key: cargo-mac-arm64-${{ hashFiles('crates/ardudeck-frame/Cargo.toml', 'crates/ardudeck-sim-engine/Cargo.toml') }}
+          restore-keys: cargo-mac-arm64-
+
+      - name: Stage open-source frame generator
+        working-directory: apps/desktop
+        run: node scripts/stage-frame.mjs
+
+      - name: Build and stage open-source sim-engine (darwin arm64)
+        run: |
+          cargo build --release --manifest-path crates/ardudeck-sim-engine/Cargo.toml
+          mkdir -p apps/desktop/sim-engine-bin
+          cp crates/ardudeck-sim-engine/target/release/ardudeck-sim-engine apps/desktop/sim-engine-bin/ardudeck-sim-engine
+          chmod +x apps/desktop/sim-engine-bin/ardudeck-sim-engine
+          codesign --force --sign - apps/desktop/sim-engine-bin/ardudeck-sim-engine
+
+      - name: Fetch mediamtx (MIT, darwin arm64)
+        run: node tools/fetch-mediamtx.mjs darwin arm64
+
+      # 僅跳過閉源多機協調引擎（fetch-engine.mjs / ardudeck-orchestrator），
+      # 建立空目錄以滿足 electron-builder 的 extraResources 路徑設定。
+      - name: Prepare empty placeholder for closed-source orchestrator
+        run: mkdir -p apps/desktop/engine
+
+      - name: Build workspace packages
+        run: pnpm build
+
+      - name: Package macOS arm64 (unsigned, skip closed-source orchestrator)
+        working-directory: apps/desktop
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+        run: pnpm exec electron-builder --mac --arm64 --publish never
+
+      - name: Rename macOS arm64 installers to fixed filenames
+        working-directory: apps/desktop/release
+        run: |
+          shopt -s nullglob
+          mkdir -p out-mac
+          for f in *.dmg; do
+            mv "$f" "out-mac/ArduDeck-macOS-arm64.dmg"
+          done
+          for f in *.zip; do
+            mv "$f" "out-mac/ArduDeck-macOS-arm64.zip"
+          done
+          ls -lh out-mac/
+
+      - name: Upload macOS arm64 artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-arm64
+          path: apps/desktop/release/out-mac/*
+          if-no-files-found: error
+
+  publish-release:
+    name: Publish to fixed Release (deck-latest)
+    needs: [build-linux, build-windows, build-mac-arm64]
+    if: always() && (needs.build-linux.result == 'success' || needs.build-windows.result == 'success' || needs.build-mac-arm64.result == 'success')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist-artifacts
+          merge-multiple: true
+
+      - name: Create or update fixed Release and clobber assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ inputs.release_tag || 'deck-latest' }}
+        run: |
+          shopt -s nullglob
+          files=(dist-artifacts/*)
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "No artifacts found to upload"
+            exit 1
+          fi
+
+          BUILD_TIME=$(date -u +"%Y-%m-%d %H:%M:%S UTC")
+          NOTES=$(cat <<EOF
+          自動建置產物（Linux Steam Deck / Windows x64 / macOS arm64，已內建開源 \`ardudeck-sim-engine\` 與 \`ardudeck-frame\`，僅跳過閉源 \`ardudeck-orchestrator\`）。
+
+          - **Ref**: \`${GITHUB_REF_NAME}\`
+          - **Commit**: \`${GITHUB_SHA::8}\`
+          - **Built at**: ${BUILD_TIME}
+          - **Steam Deck 快速更新**：
+            \`\`\`bash
+            curl -fL "https://github.com/${GITHUB_REPOSITORY}/releases/download/${RELEASE_TAG}/ArduDeck-SteamDeck-x86_64.AppImage" -o ~/Applications/ArduDeck-SteamDeck-x86_64.AppImage && chmod +x ~/Applications/ArduDeck-SteamDeck-x86_64.AppImage
+            \`\`\`
+          - **macOS (Apple Silicon) 首次開啟提示**：未經 Apple 公證簽章，安裝後如遇系統阻擋請執行 \`xattr -cr /Applications/ArduDeck.app\`。
+          EOF
+          )
+
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release edit "$RELEASE_TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --notes "$NOTES"
+          else
+            gh release create "$RELEASE_TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --target "$GITHUB_SHA" \
+              --title "ArduDeck Latest (${RELEASE_TAG})" \
+              --notes "$NOTES" \
+              --prerelease
+          fi
+
+          printf 'Uploading (clobber): %s\n' "${files[@]}"
+          gh release upload "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --clobber \
+            "${files[@]}"
